@@ -17,6 +17,7 @@ import math
 import os
 import random
 from pathlib import Path
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -52,15 +53,9 @@ class Config:
     grad_accum_steps = 4
     max_grad_norm = 1.0
 
-    # LoRA (for efficient fine-tuning)
-    use_lora = True
-    lora_r = 16
-    lora_alpha = 32
-    lora_dropout = 0.05
-
     # Data
-    train_dirs = ["data/Hands_Across_the_Sea"]
-    dev_dirs   = []   # if empty, 10% of train data is held out automatically
+    train_dirs = ["data/train/*"]
+    dev_dirs   = ["data/dev/*"]   # if empty, 10% of train data is held out automatically
 
     # Output
     output_dir = "checkpoints"
@@ -281,16 +276,34 @@ class ScoreFollowingDataset(Dataset):
         }
 
 
-def collate_fn(batch):
-    """Custom collate that handles PIL images."""
-    return {
-        "audio": torch.stack([b["audio"] for b in batch]),
-        "all_images": [b["all_images"] for b in batch],  # list of B lists of PIL Images
-        "start_pos": torch.stack([b["start_pos"] for b in batch]),
-        "start_img": torch.stack([b["start_img"] for b in batch]),
-        "target_xy": torch.stack([b["target_xy"] for b in batch]),
-        "target_img": torch.stack([b["target_img"] for b in batch]),
-    }
+def collate_fn(batch, processor, audio_sample_rate):
+    """Run the processor on the whole batch inside the DataLoader worker.
+
+    Each worker has a forked copy of the processor, so preprocessing is
+    parallelised across CPUs while the GPU runs the previous batch.
+    """
+    # Build per-sample prompts (num_pages may differ between pieces)
+    prompts = [
+        "".join(f"<|image_{j+1}|>" for j in range(len(b["all_images"])))
+        + "<|pos|><|page|><|audio_1|>"
+        for b in batch
+    ]
+    flat_images = [img for b in batch for img in b["all_images"]]
+    audios      = [(b["audio"].numpy(), audio_sample_rate) for b in batch]
+
+    inputs = processor(
+        text=prompts,
+        images=flat_images,
+        audios=audios,
+        return_tensors="pt",
+        padding=True,
+    )
+
+    inputs["start_pos"] = torch.stack([b["start_pos"] for b in batch])
+    inputs["start_img"] = torch.stack([b["start_img"] for b in batch])
+    inputs["target_xy"] = torch.stack([b["target_xy"] for b in batch])
+    inputs["target_img"] = torch.stack([b["target_img"] for b in batch])
+    return inputs
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -364,8 +377,15 @@ class ScoreFollowingModel(nn.Module):
         self.backbone = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            device_map="auto",
             attn_implementation="flash_attention_2",
+        )
+        # Properly initialise _gradient_checkpointing_func on all submodules
+        # (Phi-4's cached code sets the gradient_checkpointing flag but never
+        # calls enable(), so _gradient_checkpointing_func is missing at runtime)
+        self.backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         # Extend embedding table for the two new tokens
         self.backbone.resize_token_embeddings(len(self.processor.tokenizer))
@@ -377,57 +397,46 @@ class ScoreFollowingModel(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
+        # Auto-detect LoRA adapter names from PEFT parameter names.
+        # PEFT stores weights as  ...lora_A.{adapter_name}.weight
+        lora_adapters = set()
+        for name, _ in self.backbone.named_parameters():
+            parts = name.split(".")
+            for i, part in enumerate(parts):
+                if part in ("lora_A", "lora_B") and i + 1 < len(parts):
+                    lora_adapters.add(parts[i + 1])
+
+        # Train every adapter except the vision one (kept frozen as-is)
+        speech_adapters = lora_adapters - {"vision"}
+        print(f"All LoRA adapters found : {sorted(lora_adapters)}")
+        print(f"Adapters to fine-tune   : {sorted(speech_adapters)}")
+
         n_speech = 0
         for name, param in self.backbone.named_parameters():
-            # Phi-4-multimodal names its speech adapter weights with "speech_adapter"
-            # (verify against backbone.named_parameters() if needed)
-            if "speech_adapter" in name:
+            if any(f".{a}." in name for a in speech_adapters):
                 param.requires_grad = True
                 n_speech += param.numel()
         print(f"Trainable speech-LoRA parameters: {n_speech:,}")
 
         # ── Position and page token projections (always trainable) ───────────
+        _device = next(self.backbone.parameters()).device
         pos_enc_dim = 2 * 2 * config.pos_num_freqs      # 32 for default 8 freqs
-        self.pos_proj  = nn.Linear(pos_enc_dim, hidden_size, bias=False)
-        self.page_proj = nn.Embedding(config.max_num_images, hidden_size)
+        self.pos_proj  = nn.Linear(pos_enc_dim, hidden_size, bias=False).to(_device)
+        self.page_proj = nn.Embedding(config.max_num_images, hidden_size).to(_device)
 
         # ── Single linear head — one position prediction per token ───────────
-        self.head = nn.Linear(hidden_size, 2 + config.max_num_images)
+        self.head = nn.Linear(hidden_size, 2 + config.max_num_images).to(_device)
 
-    def forward(self, audio, all_images, start_pos, start_img):
+    def forward(self, inputs, start_pos, start_img):
         """
-        audio:      (B, T)        raw 16 kHz waveform
-        all_images: list[list]    all_images[b] = list of PIL Images for all pages
-        start_pos:  (B, 2)        normalized (x, y) ∈ [0, 1]
-        start_img:  (B,)  long    current page index
+        inputs:     dict   processor output (input_ids, pixel_values, etc.) on device
+        start_pos:  (B, 2) normalized (x, y) ∈ [0, 1]
+        start_img:  (B,)   long, current page index
 
         Returns:
             xy:         (B, seq_len, 2)              sigmoid coordinates at each token
             img_logits: (B, seq_len, max_num_images) raw page logits at each token
         """
-        B = len(all_images)
-        device = start_pos.device
-        num_pages = len(all_images[0])
-
-        # ── Build prompt: images → pos/page placeholders → audio (audio last) ─
-        img_tags = "".join(f"<|image_{j+1}|>" for j in range(num_pages))
-        prompts = [f"{img_tags}<|pos|><|page|><|audio_1|>"] * B
-
-        # Processor expects a flat list of images (all pages across all samples)
-        flat_images = [img for sample_imgs in all_images for img in sample_imgs]
-
-        inputs = self.processor(
-            text=prompts,
-            images=flat_images,
-            audios=[audio[i].cpu().numpy() for i in range(B)],
-            return_tensors="pt",
-            padding=True,
-        )
-        inputs = {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
-            for k, v in inputs.items()
-        }
-
         # ── Compute pos/page token embeddings ─────────────────────────────────
         pos_enc  = fourier_encode(start_pos, self.config.pos_num_freqs)     # (B, 32)
         pos_emb  = self.pos_proj(pos_enc.float()).to(torch.bfloat16)        # (B, H)
@@ -446,10 +455,13 @@ class ScoreFollowingModel(nn.Module):
 
         def _inject(module, args, kwargs):
             if injected[0]:
-                return
+                return args, kwargs
             hidden = args[0] if args else kwargs.get("hidden_states")
             if hidden is None:
-                return
+                return args, kwargs
+            # Clone before writing — in-place modification breaks gradient checkpointing
+            # (checkpointing saves the tensor at version N; inplace bumps it to N+1)
+            hidden = hidden.clone()
             for row in pos_locs:
                 b, s = row[0].item(), row[1].item()
                 hidden[b, s] = pos_emb[b]
@@ -457,6 +469,10 @@ class ScoreFollowingModel(nn.Module):
                 b, s = row[0].item(), row[1].item()
                 hidden[b, s] = page_emb[b]
             injected[0] = True
+            if args:
+                return (hidden,) + args[1:], kwargs
+            else:
+                return args, {**kwargs, "hidden_states": hidden}
 
         handle = self.backbone.model.layers[0].register_forward_pre_hook(
             _inject, with_kwargs=True,
@@ -527,7 +543,7 @@ def train(config=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Dataset
+    # Dataset (annotation loading only — no processor calls yet)
     train_dataset = ScoreFollowingDataset(config.train_dirs, config)
     print(f"Train samples: {len(train_dataset)}")
     if len(train_dataset) == 0:
@@ -539,7 +555,6 @@ def train(config=None):
         if len(val_dataset) == 0:
             raise RuntimeError("No dev samples found. Check --dev-dirs.")
     else:
-        # Fall back to 10% split of train data
         n_val = max(1, len(train_dataset) // 10)
         n_train = len(train_dataset) - n_val
         train_dataset, val_dataset = torch.utils.data.random_split(
@@ -548,25 +563,32 @@ def train(config=None):
         )
         print(f"Dev samples:   {len(val_dataset)} (auto split from train)")
 
+    # Model — must be created before DataLoaders so we can pass its processor
+    model = ScoreFollowingModel(config)
+
+    from functools import partial
+    _collate = partial(collate_fn,
+                       processor=model.processor,
+                       audio_sample_rate=config.audio_sample_rate)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=_collate,
         num_workers=2,
         pin_memory=True,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=_collate,
         num_workers=2,
         pin_memory=True,
+        persistent_workers=True,
     )
-
-    # Model
-    model = ScoreFollowingModel(config).to(device)
 
     # Optimizer: speech-LoRA at lower LR; projection + head at full LR
     speech_lora_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -597,22 +619,24 @@ def train(config=None):
     best_val_loss = float("inf")
     global_step = 0
 
+    print("Training starts now.")
+
     for epoch in range(config.num_epochs):
         model.train()
         epoch_loss = 0.0
         optimizer.zero_grad()
 
-        for batch_idx, batch in enumerate(train_loader):
-            audio      = batch["audio"].to(device)
-            start_pos  = batch["start_pos"].to(device)
-            start_img  = batch["start_img"].to(device)
-            target_xy  = batch["target_xy"].to(device)
-            target_img = batch["target_img"].to(device)
-            all_images = batch["all_images"]  # list of B lists of PIL Images
+        for batch_idx, batch in enumerate(tqdm(train_loader)):
+            start_pos  = batch.pop("start_pos").to(device)
+            start_img  = batch.pop("start_img").to(device)
+            target_xy  = batch.pop("target_xy").to(device)
+            target_img = batch.pop("target_img").to(device)
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                      for k, v in batch.items()}
 
             # Forward
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pred_xy, img_logits = model(audio, all_images, start_pos, start_img)
+                pred_xy, img_logits = model(inputs, start_pos, start_img)
                 loss = score_following_loss(pred_xy, img_logits, target_xy, target_img)
                 loss = loss / config.grad_accum_steps
 
@@ -632,16 +656,16 @@ def train(config=None):
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch in val_loader:
-                audio      = batch["audio"].to(device)
-                start_pos  = batch["start_pos"].to(device)
-                start_img  = batch["start_img"].to(device)
-                target_xy  = batch["target_xy"].to(device)
-                target_img = batch["target_img"].to(device)
-                all_images = batch["all_images"]
+            for batch in tqdm(val_loader):
+                start_pos  = batch.pop("start_pos").to(device)
+                start_img  = batch.pop("start_img").to(device)
+                target_xy  = batch.pop("target_xy").to(device)
+                target_img = batch.pop("target_img").to(device)
+                inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                          for k, v in batch.items()}
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred_xy, img_logits = model(audio, all_images, start_pos, start_img)
+                    pred_xy, img_logits = model(inputs, start_pos, start_img)
                     loss = score_following_loss(pred_xy, img_logits, target_xy, target_img)
                 val_loss += loss.item()
         avg_val_loss = val_loss / len(val_loader)
@@ -792,28 +816,30 @@ def compute_prefix_embeds(
     page_locs = (input_ids == model.page_token_id).nonzero(as_tuple=False)
     injected  = [False]
 
-    def _inject_and_capture(module, args, kwargs):
-        if not injected[0]:
-            hidden = args[0] if args else kwargs.get("hidden_states")
-            if hidden is not None:
-                for row in pos_locs:
-                    b, s = row[0].item(), row[1].item()
-                    hidden[b, s] = pos_emb[b]
-                for row in page_locs:
-                    b, s = row[0].item(), row[1].item()
-                    hidden[b, s] = page_emb[b]
-                injected[0] = True
-
     captured = {}
 
-    def _capture(module, args, kwargs):
-        _inject_and_capture(module, args, kwargs)
+    def _inject_and_capture(module, args, kwargs):
         hidden = args[0] if args else kwargs.get("hidden_states")
-        if hidden is not None and "embeds" not in captured:
+        if hidden is None:
+            return args, kwargs
+        hidden = hidden.clone()
+        if not injected[0]:
+            for row in pos_locs:
+                b, s = row[0].item(), row[1].item()
+                hidden[b, s] = pos_emb[b]
+            for row in page_locs:
+                b, s = row[0].item(), row[1].item()
+                hidden[b, s] = page_emb[b]
+            injected[0] = True
+        if "embeds" not in captured:
             captured["embeds"] = hidden.detach().clone()
+        if args:
+            return (hidden,) + args[1:], kwargs
+        else:
+            return args, {**kwargs, "hidden_states": hidden}
 
     handle = model.backbone.model.layers[0].register_forward_pre_hook(
-        _capture, with_kwargs=True,
+        _inject_and_capture, with_kwargs=True,
     )
     with torch.no_grad():
         model.backbone(**inputs, use_cache=False, return_dict=True)
@@ -836,7 +862,7 @@ def compute_audio_embeds(
 
     audio_inputs = model.processor(
         text=["<|audio_1|>"] * B,
-        audios=[audio[i].cpu().numpy() for i in range(B)],
+        audios=[(audio[i].cpu().numpy(), model.config.audio_sample_rate) for i in range(B)],
         return_tensors="pt",
         padding=True,
     )

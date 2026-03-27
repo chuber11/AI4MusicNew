@@ -114,13 +114,14 @@ def get_position_at_time(t_ms, line_info):
     return li["image_index"], li["xs"][0], li["avg_y"]
 
 
-def create_video(data_dir, output_path="verification_video.mp4", fps=30):
+def create_video(data_dir, output_path="verification_video.mp4", fps=30, ann_file=None):
     # Find files
     data_dir = Path(data_dir)
-    ann_files = list(data_dir.glob("annotations_*.json"))
-    if not ann_files:
-        raise FileNotFoundError(f"No annotation files found in {data_dir}")
-    ann_file = ann_files[0]
+    if ann_file is None:
+        ann_files = list(data_dir.glob("annotations_*.json"))
+        if not ann_files:
+            raise FileNotFoundError(f"No annotation files found in {data_dir}")
+        ann_file = ann_files[0]
 
     annotations = load_annotations(ann_file)
     audio_file = data_dir / annotations["audio_filename"]
@@ -233,7 +234,11 @@ def create_video(data_dir, output_path="verification_video.mp4", fps=30):
 
 
 if __name__ == "__main__":
-    import sys
-    data_dir = sys.argv[1] if len(sys.argv) > 1 else "data/Hands_Across_the_Sea"
-    output = sys.argv[2] if len(sys.argv) > 2 else "verification_video.mp4"
-    create_video(data_dir, output)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("data_dir", nargs="?", default="data/Hands_Across_the_Sea")
+    parser.add_argument("output",   nargs="?", default="verification_video.mp4")
+    parser.add_argument("--ann-file", default=None,
+                        help="Annotation JSON to use (default: annotations_*.json in data_dir)")
+    args = parser.parse_args()
+    create_video(args.data_dir, args.output, ann_file=args.ann_file)

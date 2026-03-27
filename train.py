@@ -21,14 +21,14 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import ScoreFollowingDataset, collate_fn
+from dataset import ScoreFollowingDataset, PieceBatchSampler, collate_fn
 from model import ScoreFollowingModel, export_onnx, score_following_loss
 
 
 def _trainable_state(model):
     """Return state_dict containing only parameters with requires_grad=True."""
-    return {k: v for k, v in model.state_dict().items()
-            if model.get_parameter(k).requires_grad}
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    return {k: v for k, v in model.state_dict().items() if k in trainable}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -43,19 +43,23 @@ class Config:
     audio_sample_rate = 16000       # Phi-4 audio processor expects 16kHz
 
     # Prediction
-    audio_length_sec = 10.0         # audio chunk length fed to the model (seconds)
-    sample_shift_sec = 1.0          # shift between consecutive training samples (seconds)
-    max_num_images = 10             # max number of pages/images supported
+    audio_length_sec = 20.0         # audio chunk length fed to the model (seconds)
+    sample_shift_sec = 5.0          # shift between consecutive training samples (seconds)
+    max_num_images = 5             # max number of pages/images supported
+    image_width = 256               # images are resized to this width before encoding
     pos_num_freqs = 8               # Fourier frequency bands for (x, y) encoding
 
     # Training
-    batch_size = 2
+    batch_size = 8
     learning_rate = 1e-4
     weight_decay = 0.01
     num_epochs = 50
-    warmup_ratio = 0.1
-    grad_accum_steps = 4
+    warmup_steps = 50
+    grad_accum_steps = 1
     max_grad_norm = 1.0
+    log_every_n_steps = -1
+    coord_loss_weight = 10.0
+    img_loss_weight = 1.0
 
     # Data
     train_dirs = ["data/train/*"]
@@ -63,7 +67,7 @@ class Config:
 
     # Output
     output_dir = "checkpoints"
-    save_every_n_epochs = 5
+    save_every_n_epochs = -1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -103,10 +107,12 @@ def train(config=None):
                        processor=model.processor,
                        audio_sample_rate=config.audio_sample_rate)
 
+    train_sampler = PieceBatchSampler(
+        train_dataset, config.batch_size, shuffle=True, drop_last=True,
+    )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         collate_fn=_collate,
         num_workers=2,
         pin_memory=True,
@@ -140,7 +146,7 @@ def train(config=None):
         optimizer,
         max_lr=[config.learning_rate * 0.1, config.learning_rate],
         total_steps=total_steps,
-        pct_start=config.warmup_ratio,
+        pct_start=config.warmup_steps / total_steps,
         anneal_strategy="cos",
     )
 
@@ -152,7 +158,8 @@ def train(config=None):
 
     for epoch in range(config.num_epochs):
         model.train()
-        epoch_loss = 0.0
+        epoch_loss = epoch_mse = epoch_ce = 0.0
+        epoch_steps = 0
         window_loss  = 0.0
         window_mse   = 0.0
         window_ce    = 0.0
@@ -171,12 +178,17 @@ def train(config=None):
                 pred_xy, img_logits = model(inputs, start_pos, start_img)
                 loss, coord_loss, img_loss = score_following_loss(
                     pred_xy, img_logits, target_xy, target_img,
+                    coord_weight=config.coord_loss_weight,
+                    img_weight=config.img_loss_weight,
                 )
                 loss = loss / config.grad_accum_steps
 
             loss.backward()
             step_loss = loss.item() * config.grad_accum_steps
             epoch_loss += step_loss
+            epoch_mse  += coord_loss.item()
+            epoch_ce   += img_loss.item()
+            epoch_steps += 1
 
             if (batch_idx + 1) % config.grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
@@ -189,7 +201,7 @@ def train(config=None):
                 window_ce    += img_loss.item()
                 window_steps += 1
 
-                if global_step % 10 == 0:
+                if config.log_every_n_steps > 0 and global_step % config.log_every_n_steps == 0:
                     avg_mse = window_mse / window_steps
                     avg_ce  = window_ce  / window_steps
                     print(f"  step {global_step}"
@@ -202,11 +214,13 @@ def train(config=None):
                     window_ce    = 0.0
                     window_steps = 0
 
-        avg_train_loss = epoch_loss / len(train_loader)
+        avg_train_loss = epoch_loss / epoch_steps
+        avg_train_mse  = epoch_mse  / epoch_steps
+        avg_train_ce   = epoch_ce   / epoch_steps
 
         # Validation
         model.eval()
-        val_loss = 0.0
+        val_loss = val_mse = val_ce = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader):
                 start_pos  = batch.pop("start_pos").to(device)
@@ -218,14 +232,22 @@ def train(config=None):
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred_xy, img_logits = model(inputs, start_pos, start_img)
-                    loss, _, _ = score_following_loss(
+                    loss, coord_loss, img_loss = score_following_loss(
                         pred_xy, img_logits, target_xy, target_img,
                     )
                 val_loss += loss.item()
+                val_mse  += coord_loss.item()
+                val_ce   += img_loss.item()
+
         avg_val_loss = val_loss / len(val_loader)
+        avg_val_mse  = val_mse  / len(val_loader)
+        avg_val_ce   = val_ce   / len(val_loader)
 
         print(f"Epoch {epoch+1}/{config.num_epochs}  "
-              f"train_loss={avg_train_loss:.6f}  val_loss={avg_val_loss:.6f}  "
+              f"train_loss={avg_train_loss:.6f}  mse={avg_train_mse:.6f}  "
+              f"ce={avg_train_ce:.4f}  ppl={math.exp(avg_train_ce):.2f}  |  "
+              f"val_loss={avg_val_loss:.6f}  mse={avg_val_mse:.6f}  "
+              f"ce={avg_val_ce:.4f}  ppl={math.exp(avg_val_ce):.2f}  "
               f"lr={scheduler.get_last_lr()[0]:.2e}")
 
         if avg_val_loss < best_val_loss:
@@ -240,7 +262,7 @@ def train(config=None):
             }, save_path)
             print(f"  -> Saved best model (val_loss={best_val_loss:.6f})")
 
-        if (epoch + 1) % config.save_every_n_epochs == 0:
+        if config.save_every_n_epochs > 0 and (epoch + 1) % config.save_every_n_epochs == 0:
             save_path = os.path.join(config.output_dir, f"checkpoint_epoch_{epoch+1}.pt")
             torch.save({
                 "epoch": epoch,
@@ -265,13 +287,8 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="onnx_export")
     parser.add_argument("--train-dirs", nargs="+", default=["data/train/*"])
     parser.add_argument("--dev-dirs",   nargs="+", default=["data/dev/*"])
-    parser.add_argument("--epochs",       type=int,   default=50)
-    parser.add_argument("--batch-size",   type=int,   default=2)
+    parser.add_argument("--epochs",       type=int,   default=1000)
     parser.add_argument("--lr",           type=float, default=1e-4)
-    parser.add_argument("--audio-length", type=float, default=10.0,
-                        help="Audio chunk length in seconds")
-    parser.add_argument("--sample-shift", type=float, default=1.0,
-                        help="Shift between consecutive training samples (seconds)")
 
     args = parser.parse_args()
 
@@ -279,10 +296,7 @@ if __name__ == "__main__":
     config.train_dirs       = args.train_dirs
     config.dev_dirs         = args.dev_dirs
     config.num_epochs       = args.epochs
-    config.batch_size       = args.batch_size
     config.learning_rate    = args.lr
-    config.audio_length_sec = args.audio_length
-    config.sample_shift_sec = args.sample_shift
 
     if args.mode == "train":
         train(config)

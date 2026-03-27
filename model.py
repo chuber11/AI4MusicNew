@@ -7,6 +7,67 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Token ID used by Phi-4 for image-patch positions in the sequence
+_IMAGE_SPECIAL_TOKEN_ID = 200010  # '<|endoftext10|>' in Phi-4's vocab
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cached image embedding
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CachingImageEmbed(nn.Module):
+    """Wraps Phi4MMImageEmbedding to cache per-piece image token embeddings.
+
+    The vision encoder (ViT + projection) is entirely frozen, so its output is
+    identical for every training sample that shares the same music piece.  This
+    wrapper runs the encoder once per piece, stores only the compact image-token
+    slice (shape: [n_img_tokens, hidden_size] on CPU), and on subsequent calls
+    reconstructs image_hidden_states from the cache without touching the ViT.
+
+    Usage:
+        Set  wrapper.current_piece_ids = ["piece_a", "piece_a", ...]
+        (length == batch_size) before each backbone forward call.
+        Leave as None to disable caching (e.g. during ONNX export).
+    """
+
+    def __init__(self, original: nn.Module):
+        super().__init__()
+        self.original = original
+        self._cache: dict = {}          # piece_id -> Tensor [n_img, H] on CPU
+        self.current_piece_ids = None   # list[str] | None
+
+    def forward(self, input_ids, input_embeds, image_sizes=None, wte=None, **kwargs):
+        if self.current_piece_ids is None:
+            return self.original(
+                input_ids, input_embeds, image_sizes=image_sizes, wte=wte, **kwargs
+            )
+
+        ids = self.current_piece_ids
+        img_mask = (input_ids == _IMAGE_SPECIAL_TOKEN_ID)   # (B, seq_len) bool
+
+        # ── Cache miss: run the vision encoder, store result ──────────────────
+        if any(pid not in self._cache for pid in ids):
+            with torch.no_grad():
+                full_out = self.original(
+                    input_ids, input_embeds, image_sizes=image_sizes, wte=wte, **kwargs
+                )
+            for i, pid in enumerate(ids):
+                if pid not in self._cache:
+                    self._cache[pid] = full_out[i][img_mask[i]].detach().cpu()
+            return full_out
+
+        # ── Cache hit: reconstruct without running the ViT ────────────────────
+        assert wte is not None, "wte must be provided for cache-hit reconstruction"
+        with torch.no_grad():
+            hidden = wte(input_ids).detach().clone()    # (B, seq_len, H)
+        dev, dtype = hidden.device, hidden.dtype
+        for i, pid in enumerate(ids):
+            hidden[i][img_mask[i]] = self._cache[pid].to(device=dev, dtype=dtype)
+        return hidden
+
+    def clear_cache(self):
+        self._cache.clear()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fourier positional encoding
@@ -96,6 +157,11 @@ class ScoreFollowingModel(nn.Module):
         # Extend embedding table for the two new tokens
         self.backbone.resize_token_embeddings(len(self.processor.tokenizer))
 
+        # ── Install caching wrapper around the frozen vision encoder ──────────
+        _embed_ext = self.backbone.model.embed_tokens_extend
+        self._img_cache = CachingImageEmbed(_embed_ext.image_embed)
+        _embed_ext.image_embed = self._img_cache
+
         hidden_size = self.backbone.config.hidden_size  # 3072
         self._hidden_size = hidden_size
 
@@ -114,8 +180,8 @@ class ScoreFollowingModel(nn.Module):
 
         # Train every adapter except the vision one (kept frozen as-is)
         speech_adapters = lora_adapters - {"vision"}
-        print(f"All LoRA adapters found : {sorted(lora_adapters)}")
-        print(f"Adapters to fine-tune   : {sorted(speech_adapters)}")
+        #print(f"All LoRA adapters found : {sorted(lora_adapters)}")
+        #print(f"Adapters to fine-tune   : {sorted(speech_adapters)}")
 
         n_speech = 0
         for name, param in self.backbone.named_parameters():
@@ -176,6 +242,9 @@ class ScoreFollowingModel(nn.Module):
             xy:         (B, seq_len, 2)              sigmoid coordinates at each token
             img_logits: (B, seq_len, max_num_images) raw page logits at each token
         """
+        # ── Set piece IDs for the image cache (popped before backbone call) ─────
+        self._img_cache.current_piece_ids = inputs.pop("piece_ids", None)
+
         # ── Compute pos/page token embeddings and store for hook ──────────────
         # The permanent hook registered in __init__ reads these each forward pass
         # (and again during gradient checkpointing recomputation in backward).
@@ -204,13 +273,16 @@ class ScoreFollowingModel(nn.Module):
 # Loss
 # ──────────────────────────────────────────────────────────────────────────────
 
-def score_following_loss(pred_xy, img_logits, target_xy, target_img):
+def score_following_loss(pred_xy, img_logits, target_xy, target_img,
+                         coord_weight=1.0, img_weight=1.0):
     """Per-token loss: interpolate dense targets to match actual sequence length.
 
-    pred_xy:     (B, seq_len, 2)              predicted coordinates at every token
-    img_logits:  (B, seq_len, max_num_images) predicted page logits at every token
-    target_xy:   (B, num_dense, 2)            ground truth at num_dense uniform times
-    target_img:  (B, num_dense)               ground truth page indices (long)
+    pred_xy:      (B, seq_len, 2)              predicted coordinates at every token
+    img_logits:   (B, seq_len, max_num_images) predicted page logits at every token
+    target_xy:    (B, num_dense, 2)            ground truth at num_dense uniform times
+    target_img:   (B, num_dense)               ground truth page indices (long)
+    coord_weight: scalar weight for the MSE coordinate loss
+    img_weight:   scalar weight for the CE page loss
 
     Returns:
         total_loss, coord_loss, img_loss
@@ -237,7 +309,7 @@ def score_following_loss(pred_xy, img_logits, target_xy, target_img):
         img_logits.reshape(-1, img_logits.size(-1)),
         target_img.reshape(-1),
     )
-    return coord_loss + img_loss, coord_loss, img_loss
+    return coord_weight * coord_loss + img_weight * img_loss, coord_loss, img_loss
 
 
 # ──────────────────────────────────────────────────────────────────────────────

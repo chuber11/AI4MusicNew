@@ -2,12 +2,14 @@
 
 import glob as _glob
 import json
+import random
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
 from scipy.interpolate import interp1d
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 def detect_lines(annotations):
@@ -163,6 +165,7 @@ class ScoreFollowingDataset(Dataset):
                 "start_pos": (x_start, y_start, img_idx_start),
                 "targets": targets,
                 "line_info": line_info,
+                "piece_id": str(data_dir),
             })
 
     def __len__(self):
@@ -183,7 +186,12 @@ class ScoreFollowingDataset(Dataset):
             audio_segment = np.pad(audio_segment, (0, expected_len - len(audio_segment)))
 
         from PIL import Image
-        all_images = [Image.open(str(p)).convert("RGB") for p in sample["image_paths"]]
+        all_images = []
+        for p in sample["image_paths"]:
+            img = Image.open(str(p)).convert("RGB")
+            w, h = img.size
+            img = img.resize((cfg.image_width, int(h * cfg.image_width / w)), Image.LANCZOS)
+            all_images.append(img)
 
         target_xy = torch.tensor(
             [(t[0], t[1]) for t in sample["targets"]], dtype=torch.float32,
@@ -203,6 +211,7 @@ class ScoreFollowingDataset(Dataset):
             "start_img": start_img,
             "target_xy": target_xy,
             "target_img": target_img,
+            "piece_id": sample["piece_id"],
         }
 
 
@@ -224,8 +233,55 @@ def collate_fn(batch, processor, audio_sample_rate):
         padding=True,
     )
 
-    inputs["start_pos"] = torch.stack([b["start_pos"] for b in batch])
-    inputs["start_img"] = torch.stack([b["start_img"] for b in batch])
-    inputs["target_xy"] = torch.stack([b["target_xy"] for b in batch])
+    inputs["start_pos"]  = torch.stack([b["start_pos"]  for b in batch])
+    inputs["start_img"]  = torch.stack([b["start_img"]  for b in batch])
+    inputs["target_xy"]  = torch.stack([b["target_xy"]  for b in batch])
     inputs["target_img"] = torch.stack([b["target_img"] for b in batch])
+    inputs["piece_ids"]  = [b["piece_id"] for b in batch]
     return inputs
+
+
+class PieceBatchSampler(Sampler):
+    """Yields batches where every sample comes from the same music piece.
+
+    This enables CachingImageEmbed to skip the vision encoder for all but the
+    first sample of each piece, since the sheet music images never change.
+
+    Incomplete batches (pieces with fewer than batch_size samples) are dropped
+    by default.  Pass drop_last=False to keep them.
+    """
+
+    def __init__(self, dataset, batch_size: int, shuffle: bool = True,
+                 drop_last: bool = True):
+        # Support both Dataset (has .samples) and Subset (has .indices + .dataset)
+        if hasattr(dataset, "indices"):
+            all_samples = [dataset.dataset.samples[i] for i in dataset.indices]
+        else:
+            all_samples = dataset.samples
+
+        piece_to_indices: dict = defaultdict(list)
+        for local_idx, s in enumerate(all_samples):
+            piece_to_indices[s["piece_id"]].append(local_idx)
+
+        self.batches = []
+        for indices in piece_to_indices.values():
+            indices = list(indices)
+            if shuffle:
+                random.shuffle(indices)
+            for start in range(0, len(indices), batch_size):
+                chunk = indices[start:start + batch_size]
+                if drop_last and len(chunk) < batch_size:
+                    continue
+                self.batches.append(chunk)
+
+        self._shuffle = shuffle
+        if shuffle:
+            random.shuffle(self.batches)
+
+    def __iter__(self):
+        if self._shuffle:
+            random.shuffle(self.batches)
+        yield from self.batches
+
+    def __len__(self):
+        return len(self.batches)

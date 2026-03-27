@@ -38,15 +38,10 @@ class Config:
     audio_sample_rate = 16000       # Phi-4 audio processor expects 16kHz
 
     # Prediction
-    pred_steps = 10                 # number of future positions to predict
-    pred_interval_ms = 500          # interval between predicted positions (ms)
-    sample_shift_ms = 250           # shift between training samples (ms)
+    audio_length_sec = 10.0         # audio chunk length fed to the model (seconds)
+    sample_shift_sec = 1.0          # shift between consecutive training samples (seconds)
     max_num_images = 10             # max number of pages/images supported
-
-    @property
-    def audio_segment_sec(self):
-        """Inferred from pred_steps * pred_interval_ms."""
-        return self.pred_steps * self.pred_interval_ms / 1000.0
+    pos_num_freqs = 8               # Fourier frequency bands for (x, y) encoding
 
     # Training
     batch_size = 2
@@ -64,7 +59,8 @@ class Config:
     lora_dropout = 0.05
 
     # Data
-    data_dirs = ["data/Hands_Across_the_Sea"]
+    train_dirs = ["data/Hands_Across_the_Sea"]
+    dev_dirs   = []   # if empty, 10% of train data is held out automatically
 
     # Output
     output_dir = "checkpoints"
@@ -161,7 +157,13 @@ class ScoreFollowingDataset(Dataset):
         self.processor = processor
         self.samples = []
 
-        for data_dir in data_dirs:
+        import glob as _glob
+        expanded = []
+        for pattern in data_dirs:
+            matches = _glob.glob(str(pattern))
+            expanded.extend(matches if matches else [pattern])
+
+        for data_dir in expanded:
             self._load_piece(Path(data_dir))
 
     def _load_piece(self, data_dir):
@@ -195,37 +197,30 @@ class ScoreFollowingDataset(Dataset):
             import librosa
             audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=self.config.audio_sample_rate)
 
-        # Generate samples at various start positions
-        # Use every annotation point and also random points between them
         min_t = line_info[0]["start_ms"]
         max_t = line_info[-1]["end_ms"]
-        pred_window = self.config.pred_steps * self.config.pred_interval_ms
+        audio_len_ms = self.config.audio_length_sec * 1000
+        shift_ms = int(self.config.sample_shift_sec * 1000)
 
-        # Sample start times: every sample_shift_ms where we have enough future data
-        start_times = list(range(int(min_t), int(max_t - pred_window), self.config.sample_shift_ms))
+        start_times = list(range(int(min_t), int(max_t - audio_len_ms), shift_ms))
+
+        # Dense target resolution: 200 uniformly spaced points across the audio segment
+        _N_DENSE = 200
 
         for t_start in start_times:
             # Check that audio covers this segment
-            audio_end_ms = t_start + self.config.audio_segment_sec * 1000
-            if audio_end_ms > audio_duration_ms:
+            if t_start + audio_len_ms > audio_duration_ms:
                 continue
 
             # Get start position
             img_idx_start, x_start, y_start = get_position_at_time(t_start, line_info)
 
-            # Get target positions
+            # Get targets: 200 uniformly spaced points across the audio segment
             targets = []
-            valid = True
-            for step in range(1, self.config.pred_steps + 1):
-                t_target = t_start + step * self.config.pred_interval_ms
-                if t_target > max_t:
-                    valid = False
-                    break
+            for i in range(_N_DENSE):
+                t_target = t_start + i * audio_len_ms / (_N_DENSE - 1)
                 img_idx_t, x_t, y_t = get_position_at_time(t_target, line_info)
                 targets.append((x_t, y_t, img_idx_t))
-
-            if not valid or len(targets) < self.config.pred_steps:
-                continue
 
             self.samples.append({
                 "audio_data": audio_data,
@@ -249,24 +244,23 @@ class ScoreFollowingDataset(Dataset):
         t_start_sec = sample["t_start_ms"] / 1000.0
         sr = sample["audio_sr"]
         start_sample = int(t_start_sec * sr)
-        end_sample = start_sample + int(cfg.audio_segment_sec * sr)
+        end_sample = start_sample + int(cfg.audio_length_sec * sr)
         audio_segment = sample["audio_data"][start_sample:end_sample]
 
         # Pad if too short
-        expected_len = int(cfg.audio_segment_sec * sr)
+        expected_len = int(cfg.audio_length_sec * sr)
         if len(audio_segment) < expected_len:
             audio_segment = np.pad(audio_segment, (0, expected_len - len(audio_segment)))
 
-        # Load the current image
+        # Load all pages so Phi-4 has full visual context
         from PIL import Image
-        img_path = sample["image_paths"][sample["image_index"]]
-        image = Image.open(str(img_path)).convert("RGB")
+        all_images = [Image.open(str(p)).convert("RGB") for p in sample["image_paths"]]
 
-        # Target coordinates: (pred_steps, 2) -> (x, y)
+        # Dense targets: (200, 2) uniformly across the audio segment
         target_xy = torch.tensor(
             [(t[0], t[1]) for t in sample["targets"]], dtype=torch.float32,
         )
-        # Target image indices: (pred_steps,) -> class labels for cross-entropy
+        # Target image indices: (200,) -> class labels for cross-entropy
         target_img = torch.tensor(
             [t[2] for t in sample["targets"]], dtype=torch.long,
         )
@@ -279,7 +273,7 @@ class ScoreFollowingDataset(Dataset):
 
         return {
             "audio": torch.tensor(audio_segment, dtype=torch.float32),
-            "image": image,
+            "all_images": all_images,       # list of PIL Images (one per page)
             "start_pos": start_pos,
             "start_img": start_img,
             "target_xy": target_xy,
@@ -291,7 +285,7 @@ def collate_fn(batch):
     """Custom collate that handles PIL images."""
     return {
         "audio": torch.stack([b["audio"] for b in batch]),
-        "images": [b["image"] for b in batch],
+        "all_images": [b["all_images"] for b in batch],  # list of B lists of PIL Images
         "start_pos": torch.stack([b["start_pos"] for b in batch]),
         "start_img": torch.stack([b["start_img"] for b in batch]),
         "target_xy": torch.stack([b["target_xy"] for b in batch]),
@@ -303,51 +297,35 @@ def collate_fn(batch):
 # Model
 # ──────────────────────────────────────────────────────────────────────────────
 
-class PositionPredictionHead(nn.Module):
-    """Regression head that predicts future (x, y) + image class logits."""
+def fourier_encode(x, num_freqs=8):
+    """Encode scalar(s) in [0,1] with sinusoidal Fourier features.
 
-    def __init__(self, hidden_size, pred_steps, max_num_images, start_pos_dim=2):
-        super().__init__()
-        self.pred_steps = pred_steps
-        self.max_num_images = max_num_images
-        self.out_per_step = 2 + max_num_images  # (x, y) + image logits
-        # Fuse hidden representation with start position (x, y) + image embedding
-        self.img_embed = nn.Embedding(max_num_images, 16)
-        self.proj = nn.Sequential(
-            nn.Linear(hidden_size + start_pos_dim + 16, 512),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, pred_steps * self.out_per_step),
-        )
+    Args:
+        x: (..., D) tensor of values in [0, 1]
+        num_freqs: number of frequency bands (exponentially spaced)
 
-    def forward(self, hidden_states, start_pos, start_img):
-        """
-        hidden_states: (B, hidden_size) - pooled representation from Phi-4
-        start_pos: (B, 2) - starting (x, y)
-        start_img: (B,) - starting image index (long)
-
-        Returns:
-            xy: (B, pred_steps, 2) - sigmoid-activated coordinates
-            img_logits: (B, pred_steps, max_num_images) - raw logits for cross-entropy
-        """
-        img_emb = self.img_embed(start_img)  # (B, 16)
-        combined = torch.cat([hidden_states, start_pos, img_emb], dim=-1)
-        out = self.proj(combined)
-        out = out.view(-1, self.pred_steps, self.out_per_step)
-        xy = torch.sigmoid(out[:, :, :2])
-        img_logits = out[:, :, 2:]
-        return xy, img_logits
+    Returns:
+        (..., D * 2 * num_freqs) — sin and cos at each frequency
+    """
+    freqs = 2.0 ** torch.arange(num_freqs, device=x.device, dtype=x.dtype)
+    x_freq = x.unsqueeze(-1) * freqs * math.pi          # (..., D, F)
+    encoded = torch.cat([torch.sin(x_freq), torch.cos(x_freq)], dim=-1)
+    return encoded.flatten(-2)                           # (..., D*2*F)
 
 
 class ScoreFollowingModel(nn.Module):
     """
     Phi-4-multimodal-instruct fine-tuned for score following.
 
-    Uses the model's native multimodal capabilities to process both
-    the sheet music image and audio, then predicts future positions.
+    Input sequence layout (audio last for KV-cache reuse at inference):
+        <|image_1|> ... <|image_N|>  <|pos|>  <|page|>  <|audio_1|>
+
+    - Vision-LoRA: frozen (used as-is for image tokens)
+    - Speech-LoRA: fine-tuned (handles all non-image tokens: pos, page, audio)
+    - pos/page tokens: Fourier-encoded (x,y) and learned page embedding,
+      projected to hidden_size and injected directly into the transformer
+      sequence so every attention layer can attend to them.
+    - Head: single Linear layer — the transformer already does the fusion.
     """
 
     def __init__(self, config):
@@ -355,113 +333,133 @@ class ScoreFollowingModel(nn.Module):
         self.config = config
 
         from transformers import AutoModelForCausalLM, AutoProcessor
-        import flash_attn  # noqa: F401 – check availability
 
-        # Load Phi-4-multimodal
+        # ── Processor: add placeholder tokens for position and page ──────────
         self.processor = AutoProcessor.from_pretrained(
-            config.model_name,
-            trust_remote_code=True,
+            config.model_name, trust_remote_code=True,
         )
+        self.processor.tokenizer.add_special_tokens(
+            {"additional_special_tokens": ["<|pos|>", "<|page|>"]}
+        )
+        self.pos_token_id  = self.processor.tokenizer.convert_tokens_to_ids("<|pos|>")
+        self.page_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|page|>")
 
+        # ── Backbone: load with native vision-lora and speech-lora ───────────
         self.backbone = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
         )
+        # Extend embedding table for the two new tokens
+        self.backbone.resize_token_embeddings(len(self.processor.tokenizer))
 
-        hidden_size = self.backbone.config.hidden_size
+        hidden_size = self.backbone.config.hidden_size  # 3072
+        self._hidden_size = hidden_size
 
-        # Freeze backbone initially (we'll use LoRA or selective unfreezing)
-        if config.use_lora:
-            self._apply_lora(config)
-        else:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        # ── Freeze everything; unfreeze speech-LoRA only ─────────────────────
+        for param in self.backbone.parameters():
+            param.requires_grad = False
 
-        # Prediction head (always trainable)
-        self.pred_head = PositionPredictionHead(
-            hidden_size=hidden_size,
-            pred_steps=config.pred_steps,
-            max_num_images=config.max_num_images,
-        )
+        n_speech = 0
+        for name, param in self.backbone.named_parameters():
+            # Phi-4-multimodal names its speech adapter weights with "speech_adapter"
+            # (verify against backbone.named_parameters() if needed)
+            if "speech_adapter" in name:
+                param.requires_grad = True
+                n_speech += param.numel()
+        print(f"Trainable speech-LoRA parameters: {n_speech:,}")
 
-    def _apply_lora(self, config):
-        """Apply LoRA adapters to the backbone for efficient fine-tuning."""
-        from peft import LoraConfig, get_peft_model
+        # ── Position and page token projections (always trainable) ───────────
+        pos_enc_dim = 2 * 2 * config.pos_num_freqs      # 32 for default 8 freqs
+        self.pos_proj  = nn.Linear(pos_enc_dim, hidden_size, bias=False)
+        self.page_proj = nn.Embedding(config.max_num_images, hidden_size)
 
-        lora_config = LoraConfig(
-            r=config.lora_r,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        self.backbone = get_peft_model(self.backbone, lora_config)
-        self.backbone.print_trainable_parameters()
+        # ── Single linear head — one position prediction per token ───────────
+        self.head = nn.Linear(hidden_size, 2 + config.max_num_images)
 
-    def forward(self, audio, images, start_pos, start_img):
+    def forward(self, audio, all_images, start_pos, start_img):
         """
-        audio: (B, num_samples) - raw audio waveform at 16kHz
-        images: list of B PIL Images
-        start_pos: (B, 2) - start (x, y) coordinates
-        start_img: (B,) - start image index (long)
+        audio:      (B, T)        raw 16 kHz waveform
+        all_images: list[list]    all_images[b] = list of PIL Images for all pages
+        start_pos:  (B, 2)        normalized (x, y) ∈ [0, 1]
+        start_img:  (B,)  long    current page index
 
         Returns:
-            xy: (B, pred_steps, 2) - predicted coordinates
-            img_logits: (B, pred_steps, max_num_images) - image class logits
+            xy:         (B, seq_len, 2)              sigmoid coordinates at each token
+            img_logits: (B, seq_len, max_num_images) raw page logits at each token
         """
-        batch_size = len(images)
+        B = len(all_images)
         device = start_pos.device
+        num_pages = len(all_images[0])
 
-        # Build prompts for Phi-4 multimodal
-        prompts = []
-        all_images = []
-        all_audios = []
-        for i in range(batch_size):
-            x, y = start_pos[i].tolist()
-            img_num = start_img[i].item()
-            prompt = (
-                f"<|image_1|><|audio_1|>"
-                f"Current position on the music score: x={x:.4f}, y={y:.4f}, image={img_num}. "
-                f"Predict the next positions."
-            )
-            prompts.append(prompt)
-            all_images.append(images[i])
-            # Phi-4 audio: (num_samples,) numpy array at 16kHz
-            all_audios.append(audio[i].cpu().numpy())
+        # ── Build prompt: images → pos/page placeholders → audio (audio last) ─
+        img_tags = "".join(f"<|image_{j+1}|>" for j in range(num_pages))
+        prompts = [f"{img_tags}<|pos|><|page|><|audio_1|>"] * B
 
-        # Process inputs through Phi-4 processor
+        # Processor expects a flat list of images (all pages across all samples)
+        flat_images = [img for sample_imgs in all_images for img in sample_imgs]
+
         inputs = self.processor(
             text=prompts,
-            images=all_images,
-            audios=all_audios,
+            images=flat_images,
+            audios=[audio[i].cpu().numpy() for i in range(B)],
             return_tensors="pt",
             padding=True,
         )
-        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        inputs = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in inputs.items()
+        }
 
-        # Forward through backbone - get hidden states
-        outputs = self.backbone(
-            **inputs,
-            output_hidden_states=True,
-            return_dict=True,
+        # ── Compute pos/page token embeddings ─────────────────────────────────
+        pos_enc  = fourier_encode(start_pos, self.config.pos_num_freqs)     # (B, 32)
+        pos_emb  = self.pos_proj(pos_enc.float()).to(torch.bfloat16)        # (B, H)
+        page_emb = self.page_proj(start_img).to(torch.bfloat16)            # (B, H)
+
+        # Find the sequence positions of our placeholder tokens
+        input_ids  = inputs["input_ids"]
+        pos_locs   = (input_ids == self.pos_token_id ).nonzero(as_tuple=False)
+        page_locs  = (input_ids == self.page_token_id).nonzero(as_tuple=False)
+
+        # ── Hook: inject pos/page embeddings after Phi-4's image/audio ────────
+        # By the time the first transformer layer runs, Phi-4 has already replaced
+        # image and audio placeholder tokens with encoder outputs.  We replace our
+        # two placeholder positions with the Fourier / page embeddings here.
+        injected = [False]
+
+        def _inject(module, args, kwargs):
+            if injected[0]:
+                return
+            hidden = args[0] if args else kwargs.get("hidden_states")
+            if hidden is None:
+                return
+            for row in pos_locs:
+                b, s = row[0].item(), row[1].item()
+                hidden[b, s] = pos_emb[b]
+            for row in page_locs:
+                b, s = row[0].item(), row[1].item()
+                hidden[b, s] = page_emb[b]
+            injected[0] = True
+
+        handle = self.backbone.model.layers[0].register_forward_pre_hook(
+            _inject, with_kwargs=True,
         )
+        try:
+            outputs = self.backbone(
+                **inputs,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        finally:
+            handle.remove()
 
-        # Pool the last hidden state (use the last token's representation)
-        last_hidden = outputs.hidden_states[-1]  # (B, seq_len, hidden_size)
-        # Use mean pooling over sequence for a robust representation
-        if "attention_mask" in inputs:
-            mask = inputs["attention_mask"].unsqueeze(-1).float()
-            pooled = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        else:
-            pooled = last_hidden.mean(dim=1)
-
-        pooled = pooled.float()  # Cast from bf16 to float32 for the head
-
-        # Predict positions
-        return self.pred_head(pooled, start_pos, start_img)
+        # ── Apply head at every sequence position ─────────────────────────────
+        last_hidden = outputs.hidden_states[-1].float()   # (B, seq_len, H)
+        out        = self.head(last_hidden)               # (B, seq_len, 2 + max_pages)
+        xy         = torch.sigmoid(out[:, :, :2])         # (B, seq_len, 2)
+        img_logits = out[:, :, 2:]                        # (B, seq_len, max_pages)
+        return xy, img_logits
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -469,15 +467,33 @@ class ScoreFollowingModel(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def score_following_loss(pred_xy, img_logits, target_xy, target_img):
+    """Per-token loss: interpolate dense targets to match actual sequence length.
+
+    pred_xy:     (B, seq_len, 2)              predicted coordinates at every token
+    img_logits:  (B, seq_len, max_num_images) predicted page logits at every token
+    target_xy:   (B, num_dense, 2)            ground truth at num_dense uniform times
+    target_img:  (B, num_dense)               ground truth page indices (long)
     """
-    pred_xy:     (B, pred_steps, 2) - predicted coordinates
-    img_logits:  (B, pred_steps, max_num_images) - image class logits
-    target_xy:   (B, pred_steps, 2) - ground truth coordinates
-    target_img:  (B, pred_steps) - ground truth image indices (long)
-    """
+    B, seq_len, _ = pred_xy.shape
+    num_dense = target_xy.shape[1]
+
+    if num_dense != seq_len:
+        # Interpolate xy targets (linear) and img targets (nearest) to seq_len
+        target_xy = F.interpolate(
+            target_xy.permute(0, 2, 1),   # (B, 2, num_dense)
+            size=seq_len,
+            mode="linear",
+            align_corners=True,
+        ).permute(0, 2, 1)                # (B, seq_len, 2)
+
+        target_img = F.interpolate(
+            target_img.float().unsqueeze(1),  # (B, 1, num_dense)
+            size=seq_len,
+            mode="nearest",
+        ).squeeze(1).long()               # (B, seq_len)
+
     coord_loss = F.mse_loss(pred_xy, target_xy)
-    # Reshape for cross_entropy: (B*pred_steps, max_num_images) vs (B*pred_steps,)
-    img_loss = F.cross_entropy(
+    img_loss   = F.cross_entropy(
         img_logits.reshape(-1, img_logits.size(-1)),
         target_img.reshape(-1),
     )
@@ -496,19 +512,25 @@ def train(config=None):
     print(f"Using device: {device}")
 
     # Dataset
-    dataset = ScoreFollowingDataset(config.data_dirs, config)
-    print(f"Dataset size: {len(dataset)} samples")
+    train_dataset = ScoreFollowingDataset(config.train_dirs, config)
+    print(f"Train samples: {len(train_dataset)}")
+    if len(train_dataset) == 0:
+        raise RuntimeError("No training samples found. Check --train-dirs.")
 
-    if len(dataset) == 0:
-        raise RuntimeError("No training samples generated. Check data directories.")
-
-    # Split into train/val (90/10)
-    n_val = max(1, len(dataset) // 10)
-    n_train = len(dataset) - n_val
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
-    )
+    if config.dev_dirs:
+        val_dataset = ScoreFollowingDataset(config.dev_dirs, config)
+        print(f"Dev samples:   {len(val_dataset)}")
+        if len(val_dataset) == 0:
+            raise RuntimeError("No dev samples found. Check --dev-dirs.")
+    else:
+        # Fall back to 10% split of train data
+        n_val = max(1, len(train_dataset) // 10)
+        n_train = len(train_dataset) - n_val
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+        print(f"Dev samples:   {len(val_dataset)} (auto split from train)")
 
     train_loader = DataLoader(
         train_dataset,
@@ -530,18 +552,21 @@ def train(config=None):
     # Model
     model = ScoreFollowingModel(config).to(device)
 
-    # Optimizer: different LR for backbone vs head
-    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-    head_params = list(model.pred_head.parameters())
+    # Optimizer: speech-LoRA at lower LR; projection + head at full LR
+    speech_lora_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    new_params = (
+        list(model.pos_proj.parameters())
+        + list(model.page_proj.parameters())
+        + list(model.head.parameters())
+    )
 
     optimizer = torch.optim.AdamW([
-        {"params": backbone_params, "lr": config.learning_rate * 0.1},
-        {"params": head_params, "lr": config.learning_rate},
+        {"params": speech_lora_params, "lr": config.learning_rate * 0.1},
+        {"params": new_params,         "lr": config.learning_rate},
     ], weight_decay=config.weight_decay)
 
     # Scheduler
     total_steps = len(train_loader) * config.num_epochs // config.grad_accum_steps
-    warmup_steps = int(total_steps * config.warmup_ratio)
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -562,16 +587,16 @@ def train(config=None):
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(train_loader):
-            audio = batch["audio"].to(device)
-            start_pos = batch["start_pos"].to(device)
-            start_img = batch["start_img"].to(device)
-            target_xy = batch["target_xy"].to(device)
+            audio      = batch["audio"].to(device)
+            start_pos  = batch["start_pos"].to(device)
+            start_img  = batch["start_img"].to(device)
+            target_xy  = batch["target_xy"].to(device)
             target_img = batch["target_img"].to(device)
-            images = batch["images"]  # List of PIL Images
+            all_images = batch["all_images"]  # list of B lists of PIL Images
 
             # Forward
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pred_xy, img_logits = model(audio, images, start_pos, start_img)
+                pred_xy, img_logits = model(audio, all_images, start_pos, start_img)
                 loss = score_following_loss(pred_xy, img_logits, target_xy, target_img)
                 loss = loss / config.grad_accum_steps
 
@@ -592,15 +617,15 @@ def train(config=None):
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                audio = batch["audio"].to(device)
-                start_pos = batch["start_pos"].to(device)
-                start_img = batch["start_img"].to(device)
-                target_xy = batch["target_xy"].to(device)
+                audio      = batch["audio"].to(device)
+                start_pos  = batch["start_pos"].to(device)
+                start_img  = batch["start_img"].to(device)
+                target_xy  = batch["target_xy"].to(device)
                 target_img = batch["target_img"].to(device)
-                images = batch["images"]
+                all_images = batch["all_images"]
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred_xy, img_logits = model(audio, images, start_pos, start_img)
+                    pred_xy, img_logits = model(audio, all_images, start_pos, start_img)
                     loss = score_following_loss(pred_xy, img_logits, target_xy, target_img)
                 val_loss += loss.item()
         avg_val_loss = val_loss / len(val_loader)
@@ -635,282 +660,303 @@ def train(config=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Export for mobile deployment (ONNX)
+# ONNX export — single file, LLM weights stored once
 # ──────────────────────────────────────────────────────────────────────────────
 
-def export_for_mobile(checkpoint_path, output_path="model_mobile.onnx"):
-    """Export the trained model to ONNX format for mobile deployment.
+class _StreamingScoreFollower(nn.Module):
+    """Single ONNX graph handling both prefix and audio-decode passes.
 
-    For phone/tablet deployment, use ONNX Runtime Mobile or convert further
-    to CoreML (iOS) or TFLite (Android).
+    The transformer (LLM) weights are stored exactly once in this single file.
+    The caller pre-computes inputs_embeds outside the ONNX graph using
+    compute_prefix_embeds() or compute_audio_embeds().
+
+    Prefix pass  — kv_len = 0 (empty cache):
+        inputs_embeds = image tokens + pos token + page token
+        past_keys / past_values have shape (L, B, heads, 0, head_dim)
+        → builds and returns the prefix KV cache
+
+    Audio pass   — kv_len = prefix_len (cached prefix):
+        inputs_embeds = audio tokens for this chunk
+        past_keys / past_values = prefix KV cache from prefix pass
+        → returns predictions; caller discards new_past_keys/values and
+          reuses the same fixed prefix cache for the next audio chunk
     """
-    config = Config()
-    model = ScoreFollowingModel(config)
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    def __init__(self, model: ScoreFollowingModel):
+        super().__init__()
+        self.transformer = model.backbone.model  # decoder stack, stored once
+        self.head        = model.head
 
-    # For mobile export, we extract just the prediction head and
-    # a distilled audio encoder. The full Phi-4 model is too large
-    # for mobile — see export_distilled_for_mobile() below.
-    print("NOTE: Full Phi-4 model is too large for direct mobile deployment.")
-    print("Use export_distilled_for_mobile() after knowledge distillation.")
-    print(f"Full model size: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
+    def forward(
+        self,
+        inputs_embeds:  torch.Tensor,   # (B, seq_len, H)
+        attention_mask: torch.Tensor,   # (B, kv_len + seq_len)
+        past_keys:      torch.Tensor,   # (L, B, heads, kv_len, head_dim)
+        past_values:    torch.Tensor,   # (L, B, heads, kv_len, head_dim)
+    ):
+        L   = past_keys.shape[0]
+        pkv = tuple((past_keys[i], past_values[i]) for i in range(L))
+
+        out = self.transformer(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=pkv,
+            use_cache=True,
+            return_dict=True,
+        )
+
+        # Re-stack KV cache as tensors (ONNX needs concrete tensors, not tuples)
+        new_past_keys   = torch.stack([kv[0] for kv in out.past_key_values])
+        new_past_values = torch.stack([kv[1] for kv in out.past_key_values])
+
+        # Apply head at every token position — no pooling needed
+        result     = self.head(out.last_hidden_state.float())  # (B, seq_len, 2 + max_pages)
+        pred_xy    = torch.sigmoid(result[:, :, :2])           # (B, seq_len, 2)
+        img_logits = result[:, :, 2:]                          # (B, seq_len, max_pages)
+
+        return pred_xy, img_logits, new_past_keys, new_past_values
 
 
-def export_distilled_for_mobile(checkpoint_path, output_dir="mobile_model"):
-    """Export a distilled/student model for mobile deployment.
+def _capture_inputs_embeds(model: ScoreFollowingModel, backbone_inputs: dict) -> torch.Tensor:
+    """Run the backbone up to (but not including) layer 0, capturing inputs_embeds.
 
-    Strategy for mobile deployment:
-    1. Train the full Phi-4 model (train.py)
-    2. Use knowledge distillation to train a smaller student model
-    3. Export the student model to ONNX
-    4. Convert to CoreML (iOS) or TFLite (Android) using respective tools
+    Hooks into backbone.model.layers[0] to intercept the merged hidden states
+    (image + audio + text token embeddings already merged) just before the
+    first transformer layer processes them.
+    """
+    captured = {}
 
-    The student model uses:
-    - Whisper-tiny for audio encoding (39M params)
-    - MobileNetV3-small for image encoding (2.5M params)
-    - Lightweight prediction head
-    Total: ~45M params — suitable for real-time mobile inference
+    def _hook(module, args, kwargs):
+        hidden = args[0] if args else kwargs.get("hidden_states")
+        if hidden is not None and "embeds" not in captured:
+            captured["embeds"] = hidden.detach().clone()
+
+    handle = model.backbone.model.layers[0].register_forward_pre_hook(
+        _hook, with_kwargs=True,
+    )
+    with torch.no_grad():
+        model.backbone(**backbone_inputs, use_cache=False, return_dict=True)
+    handle.remove()
+
+    return captured["embeds"]   # (B, seq_len, H)
+
+
+def compute_prefix_embeds(
+    model:     ScoreFollowingModel,
+    images:    list,            # B lists of PIL Images, each list = one sample's pages
+    start_pos: torch.Tensor,    # (B, 2)  normalized (x, y)
+    start_img: torch.Tensor,    # (B,)    long, current page index
+) -> torch.Tensor:
+    """Compute merged inputs_embeds for the prefix (images + pos + page tokens).
+
+    Not exported to ONNX — call this in Python once per piece / start position.
+    The result is passed as inputs_embeds to the ONNX graph for the prefix pass.
+    """
+    cfg       = model.config
+    B         = start_pos.shape[0]
+    device    = start_pos.device
+    num_pages = len(images[0])
+
+    img_tags = "".join(f"<|image_{j+1}|>" for j in range(num_pages))
+    texts    = [f"{img_tags}<|pos|><|page|>"] * B
+
+    inputs = model.processor(
+        text=texts, images=images, return_tensors="pt", padding=True,
+    )
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+              for k, v in inputs.items()}
+
+    # Prepare pos/page embeddings for injection
+    pos_enc  = fourier_encode(start_pos, cfg.pos_num_freqs)
+    pos_emb  = model.pos_proj(pos_enc.float()).to(torch.bfloat16)
+    page_emb = model.page_proj(start_img).to(torch.bfloat16)
+
+    input_ids = inputs["input_ids"]
+    pos_locs  = (input_ids == model.pos_token_id ).nonzero(as_tuple=False)
+    page_locs = (input_ids == model.page_token_id).nonzero(as_tuple=False)
+    injected  = [False]
+
+    def _inject_and_capture(module, args, kwargs):
+        if not injected[0]:
+            hidden = args[0] if args else kwargs.get("hidden_states")
+            if hidden is not None:
+                for row in pos_locs:
+                    b, s = row[0].item(), row[1].item()
+                    hidden[b, s] = pos_emb[b]
+                for row in page_locs:
+                    b, s = row[0].item(), row[1].item()
+                    hidden[b, s] = page_emb[b]
+                injected[0] = True
+
+    captured = {}
+
+    def _capture(module, args, kwargs):
+        _inject_and_capture(module, args, kwargs)
+        hidden = args[0] if args else kwargs.get("hidden_states")
+        if hidden is not None and "embeds" not in captured:
+            captured["embeds"] = hidden.detach().clone()
+
+    handle = model.backbone.model.layers[0].register_forward_pre_hook(
+        _capture, with_kwargs=True,
+    )
+    with torch.no_grad():
+        model.backbone(**inputs, use_cache=False, return_dict=True)
+    handle.remove()
+
+    return captured["embeds"]   # (B, prefix_seq_len, H)
+
+
+def compute_audio_embeds(
+    model: ScoreFollowingModel,
+    audio: torch.Tensor,    # (B, T)  raw 16 kHz waveform
+) -> torch.Tensor:
+    """Compute inputs_embeds for a single audio chunk.
+
+    Not exported to ONNX — call this in Python for each new audio chunk.
+    The result is passed as inputs_embeds to the ONNX graph for the audio pass.
+    """
+    B      = audio.shape[0]
+    device = audio.device
+
+    audio_inputs = model.processor(
+        text=["<|audio_1|>"] * B,
+        audios=[audio[i].cpu().numpy() for i in range(B)],
+        return_tensors="pt",
+        padding=True,
+    )
+    audio_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in audio_inputs.items()}
+
+    return _capture_inputs_embeds(model, audio_inputs)   # (B, audio_seq_len, H)
+
+
+def export_onnx(checkpoint_path, output_dir="onnx_export"):
+    """Export as a single ONNX graph — LLM weights stored exactly once.
+
+    File: score_follower.onnx
+        Inputs:
+            inputs_embeds   (B, seq_len, H)                 pre-computed embeddings
+            attention_mask  (B, kv_len + seq_len)
+            past_keys       (L, B, heads, kv_len, head_dim)
+            past_values     (L, B, heads, kv_len, head_dim)
+        Outputs:
+            pred_xy         (B, seq_len, 2)
+            img_logits      (B, seq_len, max_pages)
+            new_past_keys   (L, B, heads, kv_len + seq_len, head_dim)
+            new_past_values (L, B, heads, kv_len + seq_len, head_dim)
+
+    Inference flow:
+        # ── run once per piece / per new start position ───────────────────────
+        prefix_embeds = compute_prefix_embeds(model, images, start_pos, start_img)
+        prefix_len    = prefix_embeds.shape[1]
+        prefix_mask   = torch.ones(B, prefix_len, dtype=torch.long)
+        empty_keys    = torch.zeros(L, B, heads, 0, head_dim)
+        empty_values  = torch.zeros(L, B, heads, 0, head_dim)
+
+        _, _, past_keys, past_values = ort_session.run(None, {
+            "inputs_embeds":  prefix_embeds.numpy(),
+            "attention_mask": prefix_mask.numpy(),
+            "past_keys":      empty_keys.numpy(),
+            "past_values":    empty_values.numpy(),
+        })
+
+        # ── run for each new audio chunk ──────────────────────────────────────
+        audio_embeds = compute_audio_embeds(model, audio_chunk)   # (B, audio_len, H)
+        audio_len    = audio_embeds.shape[1]
+        full_mask    = torch.ones(B, prefix_len + audio_len, dtype=torch.long)
+
+        pred_xy, img_logits, _, _ = ort_session.run(None, {
+            "inputs_embeds":  audio_embeds.numpy(),
+            "attention_mask": full_mask.numpy(),
+            "past_keys":      past_keys,    # fixed prefix cache — reused each chunk
+            "past_values":    past_values,
+        })
+        # Discard new_past_keys/values; reuse the same prefix cache next chunk.
+
+    Deployment:
+        iOS:     coremltools.convert("score_follower.onnx")
+        Android: onnxruntime-android with ORT format conversion
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Student model architecture (same as in train_distilled)
-    from transformers import WhisperModel
-    from torchvision.models import mobilenet_v3_small
-
     config = Config()
+    model  = ScoreFollowingModel(config)
+    ckpt   = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
 
-    class MobileScoreFollower(nn.Module):
-        def __init__(self, pred_steps, max_num_images):
-            super().__init__()
-            self.pred_steps = pred_steps
-            self.max_num_images = max_num_images
-            self.out_per_step = 2 + max_num_images
+    num_layers  = model.backbone.config.num_hidden_layers
+    hidden_size = model.backbone.config.hidden_size
+    num_heads   = model.backbone.config.num_key_value_heads
+    head_dim    = hidden_size // model.backbone.config.num_attention_heads
 
-            whisper = WhisperModel.from_pretrained("openai/whisper-tiny")
-            self.audio_encoder = whisper.encoder
-            self.audio_proj = nn.Linear(384, 128)
+    streaming = _StreamingScoreFollower(model)
 
-            mobilenet = mobilenet_v3_small(pretrained=True)
-            self.image_encoder = nn.Sequential(*list(mobilenet.children())[:-1])
-            self.image_proj = nn.Linear(576, 128)
+    # ── Dummy inputs (audio-pass shape; dynamic axes cover prefix pass too) ───
+    B       = 1
+    seq_len = 32    # audio token count  (dynamic axis: seq_len)
+    kv_len  = 64    # prefix KV length   (dynamic axis: kv_len)
 
-            self.img_embed = nn.Embedding(max_num_images, 16)
-            # 128 (audio) + 128 (image) + 2 (xy) + 16 (img embed) = 274
-            self.predictor = nn.Sequential(
-                nn.Linear(274, 256), nn.GELU(), nn.Dropout(0.1),
-                nn.Linear(256, 128), nn.GELU(),
-                nn.Linear(128, pred_steps * self.out_per_step),
-            )
+    dummy_embeds = torch.randn(B, seq_len, hidden_size)
+    dummy_mask   = torch.ones(B, kv_len + seq_len, dtype=torch.long)
+    dummy_keys   = torch.zeros(num_layers, B, num_heads, kv_len, head_dim)
+    dummy_values = torch.zeros(num_layers, B, num_heads, kv_len, head_dim)
 
-        def forward(self, audio_features, image, start_pos, start_img):
-            audio_out = self.audio_encoder(audio_features).last_hidden_state
-            audio_emb = self.audio_proj(audio_out.mean(dim=1))
-            img_emb = self.image_encoder(image).squeeze(-1).squeeze(-1)
-            img_emb = self.image_proj(img_emb)
-            img_start_emb = self.img_embed(start_img)
-            combined = torch.cat([audio_emb, img_emb, start_pos, img_start_emb], dim=-1)
-            out = self.predictor(combined)
-            out = out.view(-1, self.pred_steps, self.out_per_step)
-            xy = torch.sigmoid(out[:, :, :2])
-            img_logits = out[:, :, 2:]
-            return xy, img_logits
-
-    student = MobileScoreFollower(config.pred_steps, config.max_num_images)
-    print(f"Student model size: {sum(p.numel() for p in student.parameters()) / 1e6:.1f}M params")
-
-    # Export to ONNX
-    student.eval()
-    dummy_audio = torch.randn(1, 80, 3000)
-    dummy_image = torch.randn(1, 3, 224, 224)
-    dummy_pos = torch.tensor([[0.5, 0.5]])
-    dummy_img = torch.tensor([0], dtype=torch.long)
-
-    onnx_path = os.path.join(output_dir, "score_follower.onnx")
+    output_path = os.path.join(output_dir, "score_follower.onnx")
     torch.onnx.export(
-        student,
-        (dummy_audio, dummy_image, dummy_pos, dummy_img),
-        onnx_path,
-        input_names=["audio_features", "image", "start_pos", "start_img"],
-        output_names=["pred_xy", "img_logits"],
+        streaming,
+        (dummy_embeds, dummy_mask, dummy_keys, dummy_values),
+        output_path,
+        input_names=["inputs_embeds", "attention_mask", "past_keys", "past_values"],
+        output_names=["pred_xy", "img_logits", "new_past_keys", "new_past_values"],
         dynamic_axes={
-            "audio_features": {0: "batch", 2: "time"},
-            "image": {0: "batch"},
-            "start_pos": {0: "batch"},
-            "start_img": {0: "batch"},
-            "pred_xy": {0: "batch"},
-            "img_logits": {0: "batch"},
+            "inputs_embeds":   {0: "batch", 1: "seq_len"},
+            "attention_mask":  {0: "batch", 1: "total_len"},
+            "past_keys":       {1: "batch", 3: "kv_len"},
+            "past_values":     {1: "batch", 3: "kv_len"},
+            "pred_xy":         {0: "batch", 1: "seq_len"},
+            "img_logits":      {0: "batch", 1: "seq_len"},
+            "new_past_keys":   {1: "batch", 3: "new_kv_len"},
+            "new_past_values": {1: "batch", 3: "new_kv_len"},
         },
         opset_version=17,
     )
-    print(f"ONNX model saved to: {onnx_path}")
-    print("\nNext steps for mobile deployment:")
-    print("  iOS:     python -m coremltools.converters.onnx score_follower.onnx")
-    print("  Android: python -m onnxruntime.tools.convert_onnx_models_to_ort score_follower.onnx")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Knowledge distillation training
-# ──────────────────────────────────────────────────────────────────────────────
-
-def train_distilled(teacher_checkpoint, config=None):
-    """Train a mobile-sized student model using knowledge distillation
-    from the fine-tuned Phi-4 teacher model.
-    """
-    if config is None:
-        config = Config()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load teacher
-    teacher = ScoreFollowingModel(config).to(device)
-    ckpt = torch.load(teacher_checkpoint, map_location=device)
-    teacher.load_state_dict(ckpt["model_state_dict"])
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
-
-    # Create student (defined inline for simplicity; same as in export)
-    from transformers import WhisperModel, WhisperFeatureExtractor
-    from torchvision.models import mobilenet_v3_small
-    from torchvision import transforms
-
-    class MobileScoreFollower(nn.Module):
-        def __init__(self, pred_steps, max_num_images):
-            super().__init__()
-            self.pred_steps = pred_steps
-            self.max_num_images = max_num_images
-            self.out_per_step = 2 + max_num_images
-            whisper = WhisperModel.from_pretrained("openai/whisper-tiny")
-            self.audio_encoder = whisper.encoder
-            self.audio_proj = nn.Linear(384, 128)
-            mobilenet = mobilenet_v3_small(pretrained=True)
-            self.image_encoder = nn.Sequential(*list(mobilenet.children())[:-1])
-            self.image_proj = nn.Linear(576, 128)
-            self.img_embed = nn.Embedding(max_num_images, 16)
-            # 128 (audio) + 128 (image) + 2 (xy) + 16 (img embed) = 274
-            self.predictor = nn.Sequential(
-                nn.Linear(274, 256), nn.GELU(), nn.Dropout(0.1),
-                nn.Linear(256, 128), nn.GELU(),
-                nn.Linear(128, pred_steps * self.out_per_step),
-            )
-
-        def forward(self, audio_features, image, start_pos, start_img):
-            audio_out = self.audio_encoder(audio_features).last_hidden_state
-            audio_emb = self.audio_proj(audio_out.mean(dim=1))
-            img_emb = self.image_encoder(image).squeeze(-1).squeeze(-1)
-            img_emb = self.image_proj(img_emb)
-            img_start_emb = self.img_embed(start_img)
-            combined = torch.cat([audio_emb, img_emb, start_pos, img_start_emb], dim=-1)
-            out = self.predictor(combined)
-            out = out.view(-1, self.pred_steps, self.out_per_step)
-            xy = torch.sigmoid(out[:, :, :2])
-            img_logits = out[:, :, 2:]
-            return xy, img_logits
-
-    student = MobileScoreFollower(config.pred_steps, config.max_num_images).to(device)
-    whisper_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-tiny")
-    img_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    dataset = ScoreFollowingDataset(config.data_dirs, config)
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True,
-                        collate_fn=collate_fn, num_workers=2)
-
-    optimizer = torch.optim.AdamW(student.parameters(), lr=config.learning_rate)
-
-    distill_temp = 2.0
-    alpha_distill = 0.7  # weight for distillation loss vs ground truth
-
-    for epoch in range(config.num_epochs):
-        student.train()
-        total_loss = 0.0
-
-        for batch in loader:
-            audio = batch["audio"].to(device)
-            start_pos = batch["start_pos"].to(device)
-            start_img = batch["start_img"].to(device)
-            target_xy = batch["target_xy"].to(device)
-            target_img = batch["target_img"].to(device)
-            images = batch["images"]
-
-            # Teacher predictions
-            with torch.no_grad():
-                teacher_xy, teacher_img_logits = teacher(audio, images, start_pos, start_img)
-
-            # Prepare student inputs
-            # Audio -> mel features for Whisper
-            mel_features = []
-            for a in audio:
-                feat = whisper_extractor(a.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
-                mel_features.append(feat.input_features.squeeze(0))
-            mel_features = torch.stack(mel_features).to(device)
-
-            # Images -> transformed tensors
-            img_tensors = torch.stack([img_transform(img) for img in images]).to(device)
-
-            # Student predictions
-            student_xy, student_img_logits = student(mel_features, img_tensors, start_pos, start_img)
-
-            # Combined loss: distillation + ground truth
-            distill_loss = (
-                F.mse_loss(student_xy, teacher_xy)
-                + F.mse_loss(student_img_logits, teacher_img_logits)
-            )
-            gt_loss = score_following_loss(student_xy, student_img_logits, target_xy, target_img)
-            loss = alpha_distill * distill_loss + (1 - alpha_distill) * gt_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        print(f"Distill Epoch {epoch+1}/{config.num_epochs}  loss={total_loss/len(loader):.6f}")
-
-    # Save student
-    save_path = os.path.join(config.output_dir, "student_model.pt")
-    torch.save(student.state_dict(), save_path)
-    print(f"Student model saved to: {save_path}")
-    return student
+    print(f"Score follower exported → {output_path}")
+    print("\nInference flow:")
+    print("  1. prefix_embeds = compute_prefix_embeds(model, images, pos, img)  # once")
+    print("  2. _, _, keys, vals = ort(prefix_embeds, prefix_mask, empty_kv)   # once")
+    print("  3. xy, logits, _, _ = ort(audio_embeds, full_mask, keys, vals)    # per chunk")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Score following model training")
-    parser.add_argument("--mode", choices=["train", "distill", "export"], default="train")
-    parser.add_argument("--checkpoint", type=str, help="Path to checkpoint for distill/export")
-    parser.add_argument("--data-dirs", nargs="+", default=["data/Hands_Across_the_Sea"])
+    parser.add_argument("--mode", choices=["train", "export"], default="train")
+    parser.add_argument("--checkpoint", type=str, help="Path to checkpoint for export")
+    parser.add_argument("--output-dir", type=str, default="onnx_export", help="Output dir for ONNX export")
+    parser.add_argument("--train-dirs", nargs="+", default=["data/train/*"], help="Training data folders")
+    parser.add_argument("--dev-dirs",   nargs="+", default=["data/dev/*"], help="Dev/validation data folders (omit to auto-split 10%% of train)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--pred-steps", type=int, default=10, help="Number of future positions to predict")
-    parser.add_argument("--pred-interval-ms", type=int, default=500, help="Interval between predicted positions (ms)")
-    parser.add_argument("--sample-shift-ms", type=int, default=250, help="Shift between training samples (ms)")
+    parser.add_argument("--audio-length", type=float, default=10.0, help="Audio chunk length in seconds")
+    parser.add_argument("--sample-shift", type=float, default=1.0, help="Shift between consecutive training samples (seconds)")
 
     args = parser.parse_args()
 
     config = Config()
-    config.data_dirs = args.data_dirs
+    config.train_dirs = args.train_dirs
+    config.dev_dirs   = args.dev_dirs
     config.num_epochs = args.epochs
     config.batch_size = args.batch_size
     config.learning_rate = args.lr
-    config.pred_steps = args.pred_steps
-    config.pred_interval_ms = args.pred_interval_ms
-    config.sample_shift_ms = args.sample_shift_ms
+    config.audio_length_sec = args.audio_length
+    config.sample_shift_sec = args.sample_shift
 
     if args.mode == "train":
         train(config)
-    elif args.mode == "distill":
-        if not args.checkpoint:
-            raise ValueError("--checkpoint required for distillation")
-        train_distilled(args.checkpoint, config)
     elif args.mode == "export":
         if not args.checkpoint:
             raise ValueError("--checkpoint required for export")
-        export_distilled_for_mobile(args.checkpoint)
+        export_onnx(args.checkpoint, args.output_dir)

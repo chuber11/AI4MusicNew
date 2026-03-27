@@ -345,6 +345,22 @@ class ScoreFollowingModel(nn.Module):
         self.page_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|page|>")
 
         # ── Backbone: load with native vision-lora and speech-lora ───────────
+        # Newer PEFT (≥0.13) requires prepare_inputs_for_generation on the inner
+        # Phi4MMModel when Phi-4's __init__ calls get_peft_model(self.model, ...).
+        # Phi4MMModel (the decoder) doesn't have it — only the CausalLM wrapper does.
+        # We patch PEFT once before loading so it doesn't raise; we never call
+        # generate(), so the no-op lambda is never invoked.
+        try:
+            import peft.peft_model as _peft_model
+            _orig = _peft_model.PeftModelForCausalLM.__init__
+            def _patched(self, model, peft_config, adapter_name="default", **kw):
+                if not hasattr(model, "prepare_inputs_for_generation"):
+                    model.prepare_inputs_for_generation = lambda *a, **k: {}
+                _orig(self, model, peft_config, adapter_name=adapter_name, **kw)
+            _peft_model.PeftModelForCausalLM.__init__ = _patched
+        except Exception:
+            pass
+
         self.backbone = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             trust_remote_code=True,

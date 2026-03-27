@@ -427,6 +427,39 @@ class ScoreFollowingModel(nn.Module):
         # ── Single linear head — one position prediction per token ───────────
         self.head = nn.Linear(hidden_size, 2 + config.max_num_images).to(_device)
 
+        # ── Permanent injection hook ───────────────────────────────────────────
+        # Registered once in __init__ so it fires during gradient checkpointing
+        # recomputation (which re-runs layers[0] during backward).  The actual
+        # embeddings and token locations are stored as instance attributes and
+        # updated at the start of each forward() call.
+        self._pos_emb   = None
+        self._page_emb  = None
+        self._pos_locs  = None
+        self._page_locs = None
+
+        def _permanent_inject(module, args, kwargs):
+            if self._pos_emb is None:
+                return args, kwargs
+            hidden = args[0] if args else kwargs.get("hidden_states")
+            if hidden is None:
+                return args, kwargs
+            # Clone before writing to avoid in-place modification errors with
+            # gradient checkpointing (saved tensor version must not change).
+            hidden = hidden.clone()
+            for row in self._pos_locs:
+                b, s = row[0].item(), row[1].item()
+                hidden[b, s] = self._pos_emb[b]
+            for row in self._page_locs:
+                b, s = row[0].item(), row[1].item()
+                hidden[b, s] = self._page_emb[b]
+            if args:
+                return (hidden,) + args[1:], kwargs
+            return args, {**kwargs, "hidden_states": hidden}
+
+        self.backbone.model.layers[0].register_forward_pre_hook(
+            _permanent_inject, with_kwargs=True,
+        )
+
     def forward(self, inputs, start_pos, start_img):
         """
         inputs:     dict   processor output (input_ids, pixel_values, etc.) on device
@@ -437,54 +470,21 @@ class ScoreFollowingModel(nn.Module):
             xy:         (B, seq_len, 2)              sigmoid coordinates at each token
             img_logits: (B, seq_len, max_num_images) raw page logits at each token
         """
-        # ── Compute pos/page token embeddings ─────────────────────────────────
+        # ── Compute pos/page token embeddings and store for hook ──────────────
+        # The permanent hook registered in __init__ reads these each forward pass
+        # (and again during gradient checkpointing recomputation in backward).
         pos_enc  = fourier_encode(start_pos, self.config.pos_num_freqs)     # (B, 32)
-        pos_emb  = self.pos_proj(pos_enc.float()).to(torch.bfloat16)        # (B, H)
-        page_emb = self.page_proj(start_img).to(torch.bfloat16)            # (B, H)
+        self._pos_emb   = self.pos_proj(pos_enc.float()).to(torch.bfloat16) # (B, H)
+        self._page_emb  = self.page_proj(start_img).to(torch.bfloat16)     # (B, H)
+        self._pos_locs  = (inputs["input_ids"] == self.pos_token_id ).nonzero(as_tuple=False)
+        self._page_locs = (inputs["input_ids"] == self.page_token_id).nonzero(as_tuple=False)
 
-        # Find the sequence positions of our placeholder tokens
-        input_ids  = inputs["input_ids"]
-        pos_locs   = (input_ids == self.pos_token_id ).nonzero(as_tuple=False)
-        page_locs  = (input_ids == self.page_token_id).nonzero(as_tuple=False)
-
-        # ── Hook: inject pos/page embeddings after Phi-4's image/audio ────────
-        # By the time the first transformer layer runs, Phi-4 has already replaced
-        # image and audio placeholder tokens with encoder outputs.  We replace our
-        # two placeholder positions with the Fourier / page embeddings here.
-        injected = [False]
-
-        def _inject(module, args, kwargs):
-            if injected[0]:
-                return args, kwargs
-            hidden = args[0] if args else kwargs.get("hidden_states")
-            if hidden is None:
-                return args, kwargs
-            # Clone before writing — in-place modification breaks gradient checkpointing
-            # (checkpointing saves the tensor at version N; inplace bumps it to N+1)
-            hidden = hidden.clone()
-            for row in pos_locs:
-                b, s = row[0].item(), row[1].item()
-                hidden[b, s] = pos_emb[b]
-            for row in page_locs:
-                b, s = row[0].item(), row[1].item()
-                hidden[b, s] = page_emb[b]
-            injected[0] = True
-            if args:
-                return (hidden,) + args[1:], kwargs
-            else:
-                return args, {**kwargs, "hidden_states": hidden}
-
-        handle = self.backbone.model.layers[0].register_forward_pre_hook(
-            _inject, with_kwargs=True,
+        outputs = self.backbone(
+            **inputs,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
         )
-        try:
-            outputs = self.backbone(
-                **inputs,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-        finally:
-            handle.remove()
 
         # ── Apply head at every sequence position ─────────────────────────────
         last_hidden = outputs.hidden_states[-1].float()   # (B, seq_len, H)

@@ -325,7 +325,7 @@ def score_following_loss(patch_logits, target_patches):
     target_patches: (B, num_dense)            ground truth patch indices (long)
 
     Returns:
-        loss (scalar)
+        loss (scalar), accuracy (scalar)
     """
     B, seq_len, C = patch_logits.shape
     num_dense = target_patches.shape[1]
@@ -337,10 +337,11 @@ def score_following_loss(patch_logits, target_patches):
             mode="nearest",
         ).squeeze(1).long()                       # (B, seq_len)
 
-    return F.cross_entropy(
-        patch_logits.reshape(-1, C),
-        target_patches.reshape(-1),
-    )
+    flat_logits  = patch_logits.reshape(-1, C)
+    flat_targets = target_patches.reshape(-1)
+    loss = F.cross_entropy(flat_logits, flat_targets)
+    acc  = (flat_logits.argmax(dim=-1) == flat_targets).float().mean()
+    return loss, acc
 
 
 # ──────────────────────────────────────────────────────────────────────────────

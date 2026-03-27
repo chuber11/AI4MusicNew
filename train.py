@@ -154,16 +154,18 @@ def train(config=None):
     best_val_loss = float("inf")
     global_step = 0
 
-    print("Training starts now.")
+    #print("Training starts now.")
 
     num_patches = config.grid_w * config.grid_h * config.max_num_images
-    print(f"Patch grid: {config.grid_w}x{config.grid_h} x {config.max_num_images} pages = {num_patches} classes")
+    #print(f"Patch grid: {config.grid_w}x{config.grid_h} x {config.max_num_images} pages = {num_patches} classes")
 
     for epoch in range(config.num_epochs):
         model.train()
         epoch_loss = 0.0
+        epoch_acc  = 0.0
         epoch_steps = 0
         window_loss  = 0.0
+        window_acc   = 0.0
         window_steps = 0
         optimizer.zero_grad()
 
@@ -176,12 +178,14 @@ def train(config=None):
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 patch_logits = model(inputs, start_pos, start_img)
-                loss = score_following_loss(patch_logits, target_patches)
+                loss, acc = score_following_loss(patch_logits, target_patches)
                 loss = loss / config.grad_accum_steps
 
             loss.backward()
             step_loss = loss.item() * config.grad_accum_steps
+            step_acc  = acc.item()
             epoch_loss += step_loss
+            epoch_acc  += step_acc
             epoch_steps += 1
 
             if (batch_idx + 1) % config.grad_accum_steps == 0:
@@ -191,21 +195,27 @@ def train(config=None):
                 optimizer.zero_grad()
                 global_step += 1
                 window_loss  += step_loss
+                window_acc   += step_acc
                 window_steps += 1
 
                 if config.log_every_n_steps > 0 and global_step % config.log_every_n_steps == 0:
                     avg_ce = window_loss / window_steps
+                    avg_acc = window_acc / window_steps
                     print(f"  step {global_step}"
                           f"  ce={avg_ce:.4f}  ppl={math.exp(avg_ce):.2f}"
+                          f"  acc={avg_acc:.4f}"
                           f"  lr={scheduler.get_last_lr()[0]:.2e}")
                     window_loss  = 0.0
+                    window_acc   = 0.0
                     window_steps = 0
 
-        avg_train_ce = epoch_loss / epoch_steps
+        avg_train_ce  = epoch_loss / epoch_steps
+        avg_train_acc = epoch_acc  / epoch_steps
 
         # Validation
         model.eval()
         val_loss = 0.0
+        val_acc  = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader):
                 start_pos      = batch.pop("start_pos").to(device)
@@ -216,14 +226,16 @@ def train(config=None):
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     patch_logits = model(inputs, start_pos, start_img)
-                    loss = score_following_loss(patch_logits, target_patches)
+                    loss, acc = score_following_loss(patch_logits, target_patches)
                 val_loss += loss.item()
+                val_acc  += acc.item()
 
-        avg_val_ce = val_loss / len(val_loader)
+        avg_val_ce  = val_loss / len(val_loader)
+        avg_val_acc = val_acc  / len(val_loader)
 
         print(f"Epoch {epoch+1}/{config.num_epochs}  "
-              f"train_ce={avg_train_ce:.4f}  ppl={math.exp(avg_train_ce):.2f}  |  "
-              f"val_ce={avg_val_ce:.4f}  ppl={math.exp(avg_val_ce):.2f}"
+              f"train_ce={avg_train_ce:.4f}  ppl={math.exp(avg_train_ce):.2f}  acc={avg_train_acc:.4f}  |  "
+              f"val_ce={avg_val_ce:.4f}  ppl={math.exp(avg_val_ce):.2f}  acc={avg_val_acc:.4f}"
               f"  |  lr={scheduler.get_last_lr()[0]:.2e}")
 
         if avg_val_ce < best_val_loss:

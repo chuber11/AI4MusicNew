@@ -193,11 +193,12 @@ class ScoreFollowingDataset(Dataset):
             img = img.resize((cfg.image_width, int(h * cfg.image_width / w)), Image.LANCZOS)
             all_images.append(img)
 
-        target_xy = torch.tensor(
-            [(t[0], t[1]) for t in sample["targets"]], dtype=torch.float32,
-        )
-        target_img = torch.tensor(
-            [t[2] for t in sample["targets"]], dtype=torch.long,
+        from model import xy_to_patch_index
+        grid_w, grid_h = cfg.grid_w, cfg.grid_h
+        target_patches = torch.tensor(
+            [xy_to_patch_index(t[0], t[1], t[2], grid_w, grid_h)
+             for t in sample["targets"]],
+            dtype=torch.long,
         )
         start_pos = torch.tensor(
             [sample["start_pos"][0], sample["start_pos"][1]], dtype=torch.float32,
@@ -209,8 +210,7 @@ class ScoreFollowingDataset(Dataset):
             "all_images": all_images,
             "start_pos": start_pos,
             "start_img": start_img,
-            "target_xy": target_xy,
-            "target_img": target_img,
+            "target_patches": target_patches,
             "piece_id": sample["piece_id"],
         }
 
@@ -233,11 +233,10 @@ def collate_fn(batch, processor, audio_sample_rate):
         padding=True,
     )
 
-    inputs["start_pos"]  = torch.stack([b["start_pos"]  for b in batch])
-    inputs["start_img"]  = torch.stack([b["start_img"]  for b in batch])
-    inputs["target_xy"]  = torch.stack([b["target_xy"]  for b in batch])
-    inputs["target_img"] = torch.stack([b["target_img"] for b in batch])
-    inputs["piece_ids"]  = [b["piece_id"] for b in batch]
+    inputs["start_pos"]      = torch.stack([b["start_pos"]      for b in batch])
+    inputs["start_img"]      = torch.stack([b["start_img"]      for b in batch])
+    inputs["target_patches"] = torch.stack([b["target_patches"] for b in batch])
+    inputs["piece_ids"]      = [b["piece_id"] for b in batch]
     return inputs
 
 

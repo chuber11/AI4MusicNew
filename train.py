@@ -45,9 +45,11 @@ class Config:
     # Prediction
     audio_length_sec = 20.0         # audio chunk length fed to the model (seconds)
     sample_shift_sec = 5.0          # shift between consecutive training samples (seconds)
-    max_num_images = 2             # max number of pages/images supported
+    max_num_images = 2              # max number of pages/images supported
     image_width = 256               # images are resized to this width before encoding
     pos_num_freqs = 8               # Fourier frequency bands for (x, y) encoding
+    grid_w = 32                     # patch grid width per page
+    grid_h = 32                     # patch grid height per page
 
     # Training
     batch_size = 8
@@ -58,8 +60,6 @@ class Config:
     grad_accum_steps = 1
     max_grad_norm = 1.0
     log_every_n_steps = -1
-    coord_loss_weight = 10.0
-    img_loss_weight = 1.0
 
     # Data
     train_dirs = ["data/train/*"]
@@ -156,38 +156,32 @@ def train(config=None):
 
     print("Training starts now.")
 
+    num_patches = config.grid_w * config.grid_h * config.max_num_images
+    print(f"Patch grid: {config.grid_w}x{config.grid_h} x {config.max_num_images} pages = {num_patches} classes")
+
     for epoch in range(config.num_epochs):
         model.train()
-        epoch_loss = epoch_mse = epoch_ce = 0.0
+        epoch_loss = 0.0
         epoch_steps = 0
         window_loss  = 0.0
-        window_mse   = 0.0
-        window_ce    = 0.0
         window_steps = 0
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(tqdm(train_loader)):
-            start_pos  = batch.pop("start_pos").to(device)
-            start_img  = batch.pop("start_img").to(device)
-            target_xy  = batch.pop("target_xy").to(device)
-            target_img = batch.pop("target_img").to(device)
+            start_pos      = batch.pop("start_pos").to(device)
+            start_img      = batch.pop("start_img").to(device)
+            target_patches = batch.pop("target_patches").to(device)
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                       for k, v in batch.items()}
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pred_xy, img_logits = model(inputs, start_pos, start_img)
-                loss, coord_loss, img_loss = score_following_loss(
-                    pred_xy, img_logits, target_xy, target_img,
-                    coord_weight=config.coord_loss_weight,
-                    img_weight=config.img_loss_weight,
-                )
+                patch_logits = model(inputs, start_pos, start_img)
+                loss = score_following_loss(patch_logits, target_patches)
                 loss = loss / config.grad_accum_steps
 
             loss.backward()
             step_loss = loss.item() * config.grad_accum_steps
             epoch_loss += step_loss
-            epoch_mse  += coord_loss.item()
-            epoch_ce   += img_loss.item()
             epoch_steps += 1
 
             if (batch_idx + 1) % config.grad_accum_steps == 0:
@@ -197,63 +191,43 @@ def train(config=None):
                 optimizer.zero_grad()
                 global_step += 1
                 window_loss  += step_loss
-                window_mse   += coord_loss.item()
-                window_ce    += img_loss.item()
                 window_steps += 1
 
                 if config.log_every_n_steps > 0 and global_step % config.log_every_n_steps == 0:
-                    avg_mse = window_mse / window_steps
-                    avg_ce  = window_ce  / window_steps
+                    avg_ce = window_loss / window_steps
                     print(f"  step {global_step}"
-                          f"  loss={window_loss / window_steps:.6f}"
-                          f"  mse={avg_mse:.6f}"
                           f"  ce={avg_ce:.4f}  ppl={math.exp(avg_ce):.2f}"
                           f"  lr={scheduler.get_last_lr()[0]:.2e}")
                     window_loss  = 0.0
-                    window_mse   = 0.0
-                    window_ce    = 0.0
                     window_steps = 0
 
-        avg_train_loss = epoch_loss / epoch_steps
-        avg_train_mse  = epoch_mse  / epoch_steps
-        avg_train_ce   = epoch_ce   / epoch_steps
+        avg_train_ce = epoch_loss / epoch_steps
 
         # Validation
         model.eval()
-        val_loss = val_mse = val_ce = 0.0
+        val_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader):
-                start_pos  = batch.pop("start_pos").to(device)
-                start_img  = batch.pop("start_img").to(device)
-                target_xy  = batch.pop("target_xy").to(device)
-                target_img = batch.pop("target_img").to(device)
+                start_pos      = batch.pop("start_pos").to(device)
+                start_img      = batch.pop("start_img").to(device)
+                target_patches = batch.pop("target_patches").to(device)
                 inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                           for k, v in batch.items()}
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred_xy, img_logits = model(inputs, start_pos, start_img)
-                    loss, coord_loss, img_loss = score_following_loss(
-                        pred_xy, img_logits, target_xy, target_img,
-                        coord_weight=config.coord_loss_weight,
-                        img_weight=config.img_loss_weight,
-                    )
+                    patch_logits = model(inputs, start_pos, start_img)
+                    loss = score_following_loss(patch_logits, target_patches)
                 val_loss += loss.item()
-                val_mse  += coord_loss.item()
-                val_ce   += img_loss.item()
 
-        avg_val_loss = val_loss / len(val_loader)
-        avg_val_mse  = val_mse  / len(val_loader)
-        avg_val_ce   = val_ce   / len(val_loader)
+        avg_val_ce = val_loss / len(val_loader)
 
         print(f"Epoch {epoch+1}/{config.num_epochs}  "
-              f"train_loss={avg_train_loss:.6f}  mse={avg_train_mse:.6f}  "
-              f"ce={avg_train_ce:.4f}  ppl={math.exp(avg_train_ce):.2f}  |  "
-              f"val_loss={avg_val_loss:.6f}  mse={avg_val_mse:.6f}  "
-              f"ce={avg_val_ce:.4f}  ppl={math.exp(avg_val_ce):.2f}  "
+              f"train_ce={avg_train_ce:.4f}  ppl={math.exp(avg_train_ce):.2f}  |  "
+              f"val_ce={avg_val_ce:.4f}  ppl={math.exp(avg_val_ce):.2f}"
               f"  |  lr={scheduler.get_last_lr()[0]:.2e}")
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if avg_val_ce < best_val_loss:
+            best_val_loss = avg_val_ce
             save_path = os.path.join(config.output_dir, "best_model.pt")
             torch.save({
                 "epoch": epoch,
@@ -262,17 +236,17 @@ def train(config=None):
                 "val_loss": best_val_loss,
                 "config": vars(config),
             }, save_path)
-            print(f"  -> Saved best model (val_loss={best_val_loss:.6f})")
+            print(f"  -> Saved best model (val_ce={best_val_loss:.4f})")
 
         if config.save_every_n_epochs > 0 and (epoch + 1) % config.save_every_n_epochs == 0:
             save_path = os.path.join(config.output_dir, f"checkpoint_epoch_{epoch+1}.pt")
             torch.save({
                 "epoch": epoch,
                 "trainable_state_dict": _trainable_state(model),
-                "val_loss": avg_val_loss,
+                "val_loss": avg_val_ce,
             }, save_path)
 
-    print(f"\nTraining complete. Best val_loss: {best_val_loss:.6f}")
+    print(f"\nTraining complete. Best val_ce: {best_val_loss:.4f}")
     return model
 
 

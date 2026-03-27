@@ -21,7 +21,7 @@ import torch
 from PIL import Image
 
 from dataset import detect_lines, build_interpolation, get_position_at_time
-from model import ScoreFollowingModel
+from model import ScoreFollowingModel, logits_to_position
 from train import Config
 
 
@@ -106,11 +106,14 @@ def infer(config, checkpoint_path, data_dir, output_path,
               for k, v in inputs.items()}
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        pred_xy, img_logits = model(inputs, start_pos, start_img)
+        patch_logits = model(inputs, start_pos, start_img)
 
-    pred_xy   = pred_xy[0].float().cpu()                # (seq_len, 2)
-    pred_page = img_logits[0].float().cpu().argmax(-1)  # (seq_len,)
-    seq_len   = pred_xy.shape[0]
+    # Convert patch logits to (x, y, page) via softmax-weighted average
+    patch_logits = patch_logits[0].float().cpu()          # (seq_len, num_patches)
+    pred_x, pred_y, pred_page = logits_to_position(
+        patch_logits, config.grid_w, config.grid_h, num_pages,
+    )
+    seq_len = patch_logits.shape[0]
     print(f"Model output: {seq_len} tokens")
 
     # ── Map token predictions to timestamps ───────────────────────────────────
@@ -123,8 +126,8 @@ def infer(config, checkpoint_path, data_dir, output_path,
 
         annotations.append({
             "timestamp_ms": round(t_ms),
-            "x_ratio":      float(pred_xy[tok_idx, 0]),
-            "y_ratio":      float(pred_xy[tok_idx, 1]),
+            "x_ratio":      float(pred_x[tok_idx]),
+            "y_ratio":      float(pred_y[tok_idx]),
             "image_index":  int(pred_page[tok_idx]),
         })
         t_ms += annotation_interval_ms

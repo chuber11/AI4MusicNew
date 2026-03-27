@@ -196,11 +196,12 @@ class ScoreFollowingModel(nn.Module):
         self.pos_proj  = nn.Linear(pos_enc_dim, hidden_size, bias=False).to(_device)
         self.page_proj = nn.Embedding(config.max_num_images, hidden_size).to(_device)
 
-        # ── MLP head — one position prediction per token ──────────────────────
+        # ── MLP head — one patch prediction per token ────────────────────────
+        num_patches = config.grid_w * config.grid_h * config.max_num_images
         self.head = nn.Sequential(
             nn.Linear(hidden_size, 512),
             nn.GELU(),
-            nn.Linear(512, 2 + config.max_num_images),
+            nn.Linear(512, num_patches),
         ).to(_device)
 
         # ── Permanent injection hook ───────────────────────────────────────────
@@ -243,15 +244,12 @@ class ScoreFollowingModel(nn.Module):
         start_img:  (B,)   long, current page index
 
         Returns:
-            xy:         (B, seq_len, 2)              sigmoid coordinates at each token
-            img_logits: (B, seq_len, max_num_images) raw page logits at each token
+            patch_logits: (B, seq_len, num_patches) raw logits over grid patches
         """
         # ── Set piece IDs for the image cache (popped before backbone call) ─────
         self._img_cache.current_piece_ids = inputs.pop("piece_ids", None)
 
         # ── Compute pos/page token embeddings and store for hook ──────────────
-        # The permanent hook registered in __init__ reads these each forward pass
-        # (and again during gradient checkpointing recomputation in backward).
         pos_enc  = fourier_encode(start_pos, self.config.pos_num_freqs)     # (B, 32)
         self._pos_emb   = self.pos_proj(pos_enc.float()).to(torch.bfloat16) # (B, H)
         self._page_emb  = self.page_proj(start_img).to(torch.bfloat16)     # (B, H)
@@ -266,54 +264,83 @@ class ScoreFollowingModel(nn.Module):
         )
 
         # ── Apply head at every sequence position ─────────────────────────────
-        last_hidden = outputs.hidden_states[-1].float()   # (B, seq_len, H)
-        out        = self.head(last_hidden)               # (B, seq_len, 2 + max_pages)
-        xy         = torch.sigmoid(out[:, :, :2])         # (B, seq_len, 2)
-        img_logits = out[:, :, 2:]                        # (B, seq_len, max_pages)
-        return xy, img_logits
+        last_hidden  = outputs.hidden_states[-1].float()   # (B, seq_len, H)
+        patch_logits = self.head(last_hidden)              # (B, seq_len, num_patches)
+        return patch_logits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def xy_to_patch_index(x, y, page, grid_w, grid_h):
+    """Convert (x, y, page) to a flat patch index.
+
+    Works with scalars (returns int) or tensors (returns long tensor).
+    """
+    if isinstance(x, torch.Tensor):
+        col = (x * grid_w).long().clamp(0, grid_w - 1)
+        row = (y * grid_h).long().clamp(0, grid_h - 1)
+        return page.long() * (grid_w * grid_h) + row * grid_w + col
+    col = min(int(x * grid_w), grid_w - 1)
+    row = min(int(y * grid_h), grid_h - 1)
+    return int(page) * grid_w * grid_h + row * grid_w + col
+
+
+def logits_to_position(logits, grid_w, grid_h, num_pages):
+    """Convert patch logits to (x, y, page) via softmax-weighted average.
+
+    logits: (..., num_patches)
+    Returns: x (...), y (...), page (...) as float tensors
+    """
+    probs = torch.softmax(logits.float(), dim=-1)
+    device = logits.device
+
+    # Build patch center coordinates: (num_patches,)
+    pages = torch.arange(num_pages, device=device)
+    rows  = torch.arange(grid_h, device=device)
+    cols  = torch.arange(grid_w, device=device)
+    p, r, c = torch.meshgrid(pages, rows, cols, indexing="ij")
+    center_x = (c.flatten().float() + 0.5) / grid_w
+    center_y = (r.flatten().float() + 0.5) / grid_h
+    center_p = p.flatten().float()
+
+    x    = (probs * center_x).sum(dim=-1)
+    y    = (probs * center_y).sum(dim=-1)
+    # Page: marginalize over grid cells per page, then argmax
+    per_page = probs.unflatten(-1, (num_pages, grid_h * grid_w)).sum(dim=-1)
+    page = per_page.argmax(dim=-1)
+
+    return x, y, page
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Loss
 # ──────────────────────────────────────────────────────────────────────────────
 
-def score_following_loss(pred_xy, img_logits, target_xy, target_img,
-                         coord_weight=1.0, img_weight=1.0):
-    """Per-token loss: interpolate dense targets to match actual sequence length.
+def score_following_loss(patch_logits, target_patches):
+    """Per-token CE loss: interpolate dense targets to match actual sequence length.
 
-    pred_xy:      (B, seq_len, 2)              predicted coordinates at every token
-    img_logits:   (B, seq_len, max_num_images) predicted page logits at every token
-    target_xy:    (B, num_dense, 2)            ground truth at num_dense uniform times
-    target_img:   (B, num_dense)               ground truth page indices (long)
-    coord_weight: scalar weight for the MSE coordinate loss
-    img_weight:   scalar weight for the CE page loss
+    patch_logits:   (B, seq_len, num_patches) predicted logits at every token
+    target_patches: (B, num_dense)            ground truth patch indices (long)
 
     Returns:
-        total_loss, coord_loss, img_loss
+        loss (scalar)
     """
-    B, seq_len, _ = pred_xy.shape
-    num_dense = target_xy.shape[1]
+    B, seq_len, C = patch_logits.shape
+    num_dense = target_patches.shape[1]
 
     if num_dense != seq_len:
-        target_xy = F.interpolate(
-            target_xy.permute(0, 2, 1),   # (B, 2, num_dense)
-            size=seq_len,
-            mode="linear",
-            align_corners=True,
-        ).permute(0, 2, 1)                # (B, seq_len, 2)
-
-        target_img = F.interpolate(
-            target_img.float().unsqueeze(1),  # (B, 1, num_dense)
+        target_patches = F.interpolate(
+            target_patches.float().unsqueeze(1),  # (B, 1, num_dense)
             size=seq_len,
             mode="nearest",
-        ).squeeze(1).long()               # (B, seq_len)
+        ).squeeze(1).long()                       # (B, seq_len)
 
-    coord_loss = F.mse_loss(pred_xy, target_xy)
-    img_loss   = F.cross_entropy(
-        img_logits.reshape(-1, img_logits.size(-1)),
-        target_img.reshape(-1),
+    return F.cross_entropy(
+        patch_logits.reshape(-1, C),
+        target_patches.reshape(-1),
     )
-    return coord_weight * coord_loss + img_weight * img_loss, coord_loss, img_loss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -366,11 +393,9 @@ class _StreamingScoreFollower(nn.Module):
         new_past_keys   = torch.stack([kv[0] for kv in out.past_key_values])
         new_past_values = torch.stack([kv[1] for kv in out.past_key_values])
 
-        result     = self.head(out.last_hidden_state.float())  # (B, seq_len, 2 + max_pages)
-        pred_xy    = torch.sigmoid(result[:, :, :2])           # (B, seq_len, 2)
-        img_logits = result[:, :, 2:]                          # (B, seq_len, max_pages)
+        patch_logits = self.head(out.last_hidden_state.float())  # (B, seq_len, num_patches)
 
-        return pred_xy, img_logits, new_past_keys, new_past_values
+        return patch_logits, new_past_keys, new_past_values
 
 
 def _capture_inputs_embeds(model: ScoreFollowingModel, backbone_inputs: dict) -> torch.Tensor:
@@ -492,8 +517,7 @@ def export_onnx(config, checkpoint_path, output_dir="onnx_export"):
             past_keys       (L, B, heads, kv_len, head_dim)
             past_values     (L, B, heads, kv_len, head_dim)
         Outputs:
-            pred_xy         (B, seq_len, 2)
-            img_logits      (B, seq_len, max_pages)
+            patch_logits    (B, seq_len, num_patches)
             new_past_keys   (L, B, heads, kv_len + seq_len, head_dim)
             new_past_values (L, B, heads, kv_len + seq_len, head_dim)
     """
@@ -528,14 +552,13 @@ def export_onnx(config, checkpoint_path, output_dir="onnx_export"):
         (dummy_embeds, dummy_mask, dummy_keys, dummy_values),
         output_path,
         input_names=["inputs_embeds", "attention_mask", "past_keys", "past_values"],
-        output_names=["pred_xy", "img_logits", "new_past_keys", "new_past_values"],
+        output_names=["patch_logits", "new_past_keys", "new_past_values"],
         dynamic_axes={
             "inputs_embeds":   {0: "batch", 1: "seq_len"},
             "attention_mask":  {0: "batch", 1: "total_len"},
             "past_keys":       {1: "batch", 3: "kv_len"},
             "past_values":     {1: "batch", 3: "kv_len"},
-            "pred_xy":         {0: "batch", 1: "seq_len"},
-            "img_logits":      {0: "batch", 1: "seq_len"},
+            "patch_logits":    {0: "batch", 1: "seq_len"},
             "new_past_keys":   {1: "batch", 3: "new_kv_len"},
             "new_past_values": {1: "batch", 3: "new_kv_len"},
         },
@@ -544,5 +567,6 @@ def export_onnx(config, checkpoint_path, output_dir="onnx_export"):
     print(f"Score follower exported → {output_path}")
     print("\nInference flow:")
     print("  1. prefix_embeds = compute_prefix_embeds(model, images, pos, img)  # once")
-    print("  2. _, _, keys, vals = ort(prefix_embeds, prefix_mask, empty_kv)   # once")
-    print("  3. xy, logits, _, _ = ort(audio_embeds, full_mask, keys, vals)    # per chunk")
+    print("  2. _, keys, vals = ort(prefix_embeds, prefix_mask, empty_kv)      # once")
+    print("  3. logits, _, _  = ort(audio_embeds, full_mask, keys, vals)       # per chunk")
+    print("  4. x, y, page   = logits_to_position(logits, grid_w, grid_h, N)  # decode")

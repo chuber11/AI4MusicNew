@@ -196,8 +196,12 @@ class ScoreFollowingModel(nn.Module):
         self.pos_proj  = nn.Linear(pos_enc_dim, hidden_size, bias=False).to(_device)
         self.page_proj = nn.Embedding(config.max_num_images, hidden_size).to(_device)
 
-        # ── Single linear head — one position prediction per token ───────────
-        self.head = nn.Linear(hidden_size, 2 + config.max_num_images).to(_device)
+        # ── MLP head — one position prediction per token ──────────────────────
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, 512),
+            nn.GELU(),
+            nn.Linear(512, 2 + config.max_num_images),
+        ).to(_device)
 
         # ── Permanent injection hook ───────────────────────────────────────────
         # Registered once in __init__ so it fires during gradient checkpointing

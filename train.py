@@ -45,7 +45,7 @@ class Config:
     # Prediction
     audio_length_sec = 20.0         # audio chunk length fed to the model (seconds)
     sample_shift_sec = 5.0          # shift between consecutive training samples (seconds)
-    max_num_images = 5             # max number of pages/images supported
+    max_num_images = 2             # max number of pages/images supported
     image_width = 256               # images are resized to this width before encoding
     pos_num_freqs = 8               # Fourier frequency bands for (x, y) encoding
 
@@ -54,7 +54,7 @@ class Config:
     learning_rate = 1e-4
     weight_decay = 0.01
     num_epochs = 50
-    warmup_steps = 50
+    warmup_steps = 15
     grad_accum_steps = 1
     max_grad_norm = 1.0
     log_every_n_steps = -1
@@ -137,14 +137,14 @@ def train(config=None):
     )
 
     optimizer = torch.optim.AdamW([
-        {"params": speech_lora_params, "lr": config.learning_rate * 0.1},
+        {"params": speech_lora_params, "lr": config.learning_rate},
         {"params": new_params,         "lr": config.learning_rate},
     ], weight_decay=config.weight_decay)
 
     total_steps = len(train_loader) * config.num_epochs // config.grad_accum_steps
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[config.learning_rate * 0.1, config.learning_rate],
+        max_lr=[config.learning_rate, config.learning_rate],
         total_steps=total_steps,
         pct_start=config.warmup_steps / total_steps,
         anneal_strategy="cos",
@@ -234,6 +234,8 @@ def train(config=None):
                     pred_xy, img_logits = model(inputs, start_pos, start_img)
                     loss, coord_loss, img_loss = score_following_loss(
                         pred_xy, img_logits, target_xy, target_img,
+                        coord_weight=config.coord_loss_weight,
+                        img_weight=config.img_loss_weight,
                     )
                 val_loss += loss.item()
                 val_mse  += coord_loss.item()
@@ -248,7 +250,7 @@ def train(config=None):
               f"ce={avg_train_ce:.4f}  ppl={math.exp(avg_train_ce):.2f}  |  "
               f"val_loss={avg_val_loss:.6f}  mse={avg_val_mse:.6f}  "
               f"ce={avg_val_ce:.4f}  ppl={math.exp(avg_val_ce):.2f}  "
-              f"lr={scheduler.get_last_lr()[0]:.2e}")
+              f"  |  lr={scheduler.get_last_lr()[0]:.2e}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss

@@ -9,7 +9,7 @@ The starting cursor position is interpolated from the ground-truth annotation.
 Usage:
     python infer.py --data-dir data/MyPiece --checkpoint checkpoints/best_model.pt
     python infer.py --data-dir data/MyPiece --checkpoint checkpoints/best_model.pt \\
-                    --start-sec 30 --output predictions.json --interval 100
+                    --model-type baseline --start-sec 30 --output predictions.json
 """
 
 import argparse
@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from dataset import detect_lines, build_interpolation, get_position_at_time
+from dataset import detect_lines, build_interpolation, get_position_at_time, build_bar_timeline, get_bar_at_time
 from model import ScoreFollowingModel, logits_to_position
 from train import Config
 
@@ -41,12 +41,14 @@ def infer(config, checkpoint_path, data_dir, output_path,
     audio_path      = data_dir / audio_filename
 
     # ── Interpolate start position from ground-truth annotation ───────────────
-    lines     = detect_lines(existing)
-    line_info = build_interpolation(lines)
-    start_ms  = start_sec * 1000.0
+    lines      = detect_lines(existing)
+    line_info  = build_interpolation(lines)
+    bar_events = build_bar_timeline(existing["annotations"])
+    start_ms   = start_sec * 1000.0
     img_idx_start, x_start, y_start = get_position_at_time(start_ms, line_info)
+    bar_start = get_bar_at_time(start_ms, bar_events)
     print(f"Start position at {start_sec:.1f}s: "
-          f"page={img_idx_start}  x={x_start:.3f}  y={y_start:.3f}")
+          f"page={img_idx_start}  x={x_start:.3f}  y={y_start:.3f}  bar={bar_start}")
 
     # ── Load audio ────────────────────────────────────────────────────────────
     try:
@@ -64,7 +66,6 @@ def infer(config, checkpoint_path, data_dir, output_path,
 
     audio_duration_ms = len(audio_data) / config.audio_sample_rate * 1000
 
-    # Trim to [start_sec, end]
     start_sample = int(start_sec * config.audio_sample_rate)
     audio_data   = audio_data[start_sample:].astype(np.float32)
     infer_duration_ms = len(audio_data) / config.audio_sample_rate * 1000
@@ -78,46 +79,74 @@ def infer(config, checkpoint_path, data_dir, output_path,
         all_images.append(img)
 
     num_pages = len(all_images)
-    prompt = "".join(f"<|image_{j+1}|>" for j in range(num_pages)) + "<|pos|><|page|><|audio_1|>"
 
     # ── Load model ────────────────────────────────────────────────────────────
     print("Loading model...")
-    model = ScoreFollowingModel(config)
-    ckpt  = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    key   = "trainable_state_dict" if "trainable_state_dict" in ckpt else "model_state_dict"
-    model.load_state_dict(ckpt[key], strict=False)
-    model.eval()
+    if config.model_type == "baseline":
+        from baseline_model import BaselineScoreFollowingModel
+        model = BaselineScoreFollowingModel(config)
+        ckpt  = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        key   = "trainable_state_dict" if "trainable_state_dict" in ckpt else "model_state_dict"
+        model.load_state_dict(ckpt[key], strict=False)
+        model.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
 
-    device = next(model.backbone.parameters()).device
+        start_pos = torch.tensor([[x_start, y_start]], dtype=torch.float32, device=device)
+        start_img = torch.tensor([img_idx_start],      dtype=torch.long,    device=device)
+        start_bar_t = torch.tensor([min(bar_start, config.max_bar - 1)], dtype=torch.long, device=device)
 
-    start_pos = torch.tensor([[x_start, y_start]], dtype=torch.float32, device=device)
-    start_img = torch.tensor([img_idx_start],      dtype=torch.long,    device=device)
+        feats = model.audio_feature_extractor(
+            [audio_data], sampling_rate=config.audio_sample_rate,
+            return_tensors="pt", padding="longest",
+        )
+        img_inputs = model.clip_processor(images=all_images, return_tensors="pt")
+        inputs = {
+            "audio_features": feats["input_features"],
+            "pixel_values":   img_inputs["pixel_values"],
+            "num_pages":      num_pages,
+        }
+    else:
+        model = ScoreFollowingModel(config)
+        ckpt  = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        key   = "trainable_state_dict" if "trainable_state_dict" in ckpt else "model_state_dict"
+        model.load_state_dict(ckpt[key], strict=False)
+        model.eval()
+        device = next(model.backbone.parameters()).device
+
+        start_pos = torch.tensor([[x_start, y_start]], dtype=torch.float32, device=device)
+        start_img = torch.tensor([img_idx_start],      dtype=torch.long,    device=device)
+        start_bar_t = torch.tensor([min(bar_start, config.max_bar - 1)], dtype=torch.long, device=device)
+
+        prompt = "".join(f"<|image_{j+1}|>" for j in range(num_pages)) + "<|pos|><|page|><|bar|><|audio_1|>"
+        inputs = model.processor(
+            text=[prompt],
+            images=all_images,
+            audios=[(audio_data, config.audio_sample_rate)],
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                  for k, v in inputs.items()}
 
     # ── Single forward pass on the full audio ─────────────────────────────────
     print(f"Running inference on {infer_duration_ms/1000:.1f}s of audio...")
-    inputs = model.processor(
-        text=[prompt],
-        images=all_images,
-        audios=[(audio_data, config.audio_sample_rate)],
-        return_tensors="pt",
-        padding=True,
-    )
-    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-              for k, v in inputs.items()}
-
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        patch_logits = model(inputs, start_pos, start_img)
+        pos_logits, page_logits, bar_logits = model(inputs, start_pos, start_img, start_bar_t)
 
-    # Convert patch logits to (x, y, page) via softmax-weighted average
-    patch_logits = patch_logits[0].float().cpu()          # (seq_len, num_patches)
-    pred_x, pred_y, pred_page = logits_to_position(
-        patch_logits, config.grid_w, config.grid_h, num_pages,
+    # Convert logits to (x, y, page, bar) via softmax-weighted average / argmax
+    pos_logits  = pos_logits[0].float().cpu()    # (seq_len, grid_w*grid_h)
+    page_logits = page_logits[0].float().cpu()   # (seq_len, max_num_images)
+    bar_logits  = bar_logits[0].float().cpu()    # (seq_len, max_bar)
+
+    pred_x, pred_y, pred_page, pred_bar = logits_to_position(
+        pos_logits, page_logits, bar_logits,
+        config.grid_w, config.grid_h,
     )
-    seq_len = patch_logits.shape[0]
+    seq_len = pos_logits.shape[0]
     print(f"Model output: {seq_len} tokens")
 
     # ── Map token predictions to timestamps ───────────────────────────────────
-    # Tokens are treated as uniformly covering [start_ms, start_ms + infer_duration_ms]
     annotations = []
     t_ms = start_ms
     while t_ms <= start_ms + infer_duration_ms:
@@ -129,6 +158,7 @@ def infer(config, checkpoint_path, data_dir, output_path,
             "x_ratio":      float(pred_x[tok_idx]),
             "y_ratio":      float(pred_y[tok_idx]),
             "image_index":  int(pred_page[tok_idx]),
+            "bar":          int(pred_bar[tok_idx]),
         })
         t_ms += annotation_interval_ms
 
@@ -147,21 +177,17 @@ def infer(config, checkpoint_path, data_dir, output_path,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir",   required=True,
-                        help="Directory with audio, images, and annotations_*.json")
-    parser.add_argument("--checkpoint", required=True,
-                        help="Path to model checkpoint (.pt)")
-    parser.add_argument("--output",     default=None,
-                        help="Output JSON path (default: <data-dir>/predictions.json)")
-    parser.add_argument("--start-sec",  type=float, default=0.0,
-                        help="Start time in seconds; cursor position is taken from "
-                             "the ground-truth annotation at that time (default: 0)")
-    parser.add_argument("--interval",   type=float, default=100,
-                        help="Annotation interval in ms (default: 100)")
+    parser.add_argument("--data-dir",   required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--model-type", choices=["phi4", "baseline"], default="phi4")
+    parser.add_argument("--output",     default=None)
+    parser.add_argument("--start-sec",  type=float, default=0.0)
+    parser.add_argument("--interval",   type=float, default=100)
     args = parser.parse_args()
 
     output = args.output or str(Path(args.data_dir) / "predictions.json")
 
     config = Config()
+    config.model_type = args.model_type
     infer(config, args.checkpoint, args.data_dir, output,
           start_sec=args.start_sec, annotation_interval_ms=args.interval)

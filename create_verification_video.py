@@ -27,8 +27,10 @@ def detect_lines(annotations):
       - x_ratio drops significantly (cursor wraps to next line), OR
       - y_ratio jumps significantly (repeat / da capo), OR
       - image_index changes (page turn)
+
+    Bar-annotation entries (image_index == -1) are skipped.
     """
-    anns = annotations["annotations"]
+    anns = [a for a in annotations["annotations"] if a["image_index"] != -1]
     lines = []
     current_line = [anns[0]]
     for i in range(1, len(anns)):
@@ -44,6 +46,42 @@ def detect_lines(annotations):
             current_line.append(a)
     lines.append(current_line)
     return lines
+
+
+def build_bar_timeline(all_annotations):
+    """Build sorted (timestamp_ms, bar_value) events from raw annotation list."""
+    normal_anns = sorted(
+        [a for a in all_annotations if a["image_index"] != -1],
+        key=lambda a: a["timestamp_ms"],
+    )
+    bar_anns = sorted(
+        [a for a in all_annotations
+         if a["image_index"] == -1 and a.get("label", "").startswith("bar_")],
+        key=lambda a: a["timestamp_ms"],
+    )
+    events = [(a["timestamp_ms"], 0) for a in normal_anns]
+    for a in bar_anns:
+        n = int(a["label"].split("_")[1])
+        events.append((a["timestamp_ms"], n))
+    bar2_times = {a["timestamp_ms"] for a in bar_anns if a["label"] == "bar_2"}
+    normal_times = [a["timestamp_ms"] for a in normal_anns]
+    for t2 in sorted(bar2_times):
+        preceding = [t for t in normal_times if t < t2]
+        if preceding:
+            events.append((max(preceding) + 1, 1))
+    events.sort()
+    return events
+
+
+def get_bar_at_time(t_ms, bar_events):
+    """Return bar value at t_ms (0=playing, N=bar N of rest)."""
+    bar = 0
+    for ts, val in bar_events:
+        if ts <= t_ms:
+            bar = val
+        else:
+            break
+    return bar
 
 
 def build_interpolation(lines):
@@ -136,9 +174,10 @@ def create_video(data_dir, output_path="verification_video.mp4", fps=30, ann_fil
             raise FileNotFoundError(f"Cannot load image: {img_path}")
         images.append(img)
 
-    # Build interpolation
-    lines = detect_lines(annotations)
-    line_info = build_interpolation(lines)
+    # Build interpolation and bar timeline
+    lines      = detect_lines(annotations)
+    line_info  = build_interpolation(lines)
+    bar_events = build_bar_timeline(annotations["annotations"])
 
     # Video dimensions: use the max image dimensions
     max_h = max(img.shape[0] for img in images)
@@ -159,21 +198,35 @@ def create_video(data_dir, output_path="verification_video.mp4", fps=30, ann_fil
     total_frames = int(audio_duration_ms / 1000 * fps)
     print(f"Generating {total_frames} frames at {fps} fps...")
 
-    # Precompute original annotation positions for drawing
+    # Precompute annotation lists for drawing
     orig_annotations = annotations["annotations"]
+    # Build a map: timestamp_ms -> bar label for bar annotations, used to draw markers
+    bar_annotation_times = {
+        a["timestamp_ms"]: a["label"]
+        for a in orig_annotations
+        if a["image_index"] == -1 and a.get("label", "").startswith("bar_")
+    }
 
     for frame_idx in range(total_frames):
         t_ms = frame_idx / fps * 1000
 
         img_idx, x_ratio, y_ratio = get_position_at_time(t_ms, line_info)
+        bar_val = get_bar_at_time(t_ms, bar_events)
 
         # Create frame
         frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
 
-        # Draw header
-        cv2.rectangle(frame, (0, 0), (frame_w, header_h), (40, 40, 40), -1)
-        time_str = f"Time: {t_ms/1000:.2f}s  |  Image: {img_idx+1}/{len(images)}  |  x={x_ratio:.3f}  y={y_ratio:.3f}"
-        cv2.putText(frame, time_str, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Draw header — highlight in orange during rests
+        header_color = (0, 80, 160) if bar_val == 0 else (0, 100, 200)
+        cv2.rectangle(frame, (0, 0), (frame_w, header_h), header_color, -1)
+
+        bar_str = "playing" if bar_val == 0 else f"REST bar {bar_val}"
+        time_str = (
+            f"Time: {t_ms/1000:.2f}s  |  Page: {img_idx+1}/{len(images)}"
+            f"  |  x={x_ratio:.3f}  y={y_ratio:.3f}  |  {bar_str}"
+        )
+        text_color = (255, 255, 255) if bar_val == 0 else (0, 200, 255)
+        cv2.putText(frame, time_str, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
 
         # Draw image
         img = images[img_idx].copy()
@@ -196,12 +249,25 @@ def create_video(data_dir, output_path="verification_video.mp4", fps=30, ann_fil
                 for pt in pts:
                     cv2.circle(img, pt, 5, (0, 255, 0), -1)
 
-        # Draw current interpolated position (big red circle + crosshair)
+        # Draw bar-annotation timestamps as vertical cyan lines at image bottom
+        # Show bars within ±5 seconds of current time
+        for bar_t_ms, bar_label in bar_annotation_times.items():
+            if abs(bar_t_ms - t_ms) < 5000:
+                # Map time to x position within the image (rough linear mapping)
+                x_frac = (bar_t_ms - (t_ms - 5000)) / 10000.0
+                bx = int(x_frac * iw)
+                if 0 <= bx < iw:
+                    cv2.line(img, (bx, ih - 30), (bx, ih), (255, 255, 0), 2)
+                    cv2.putText(img, bar_label, (bx + 2, ih - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+        # Draw current interpolated position — cyan crosshair during rest, red during playing
         cx = int(x_ratio * iw)
         cy = int(y_ratio * ih)
-        cv2.circle(img, (cx, cy), 15, (0, 0, 255), 3)
-        cv2.line(img, (cx - 20, cy), (cx + 20, cy), (0, 0, 255), 2)
-        cv2.line(img, (cx, cy - 20), (cx, cy + 20), (0, 0, 255), 2)
+        cursor_color = (0, 0, 255) if bar_val == 0 else (0, 200, 255)
+        cv2.circle(img, (cx, cy), 15, cursor_color, 3)
+        cv2.line(img, (cx - 20, cy), (cx + 20, cy), cursor_color, 2)
+        cv2.line(img, (cx, cy - 20), (cx, cy + 20), cursor_color, 2)
 
         # Place image in frame
         frame[header_h:header_h + ih, :iw] = img

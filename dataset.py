@@ -13,8 +13,11 @@ from torch.utils.data import Dataset, Sampler
 
 
 def detect_lines(annotations):
-    """Detect music lines by finding where x_ratio drops or y_ratio jumps."""
-    anns = annotations["annotations"]
+    """Detect music lines by finding where x_ratio drops or y_ratio jumps.
+
+    Bar-annotation entries (image_index == -1) are skipped.
+    """
+    anns = [a for a in annotations["annotations"] if a["image_index"] != -1]
     lines = []
     current_line = [anns[0]]
     for i in range(1, len(anns)):
@@ -82,6 +85,57 @@ def get_position_at_time(t_ms, line_info):
     return li["image_index"], li["xs"][0], li["avg_y"]
 
 
+def build_bar_timeline(all_annotations):
+    """Build a sorted list of (timestamp_ms, bar_value) events.
+
+    bar_value = 0 during playing, N >= 1 during bar N of a multi-bar rest.
+
+    The first bar of a rest (bar_1) is implicit: it starts right after the
+    last normal annotation that precedes a bar_2 label.  All subsequent bars
+    are marked explicitly with bar_2, bar_3, … labels.
+
+    Pieces with no bar annotations return a list of (t, 0) events so that
+    get_bar_at_time always returns 0 (= playing) for those pieces.
+    """
+    normal_anns = sorted(
+        [a for a in all_annotations if a["image_index"] != -1],
+        key=lambda a: a["timestamp_ms"],
+    )
+    bar_anns = sorted(
+        [a for a in all_annotations
+         if a["image_index"] == -1 and a.get("label", "").startswith("bar_")],
+        key=lambda a: a["timestamp_ms"],
+    )
+
+    events = [(a["timestamp_ms"], 0) for a in normal_anns]
+    for a in bar_anns:
+        n = int(a["label"].split("_")[1])
+        events.append((a["timestamp_ms"], n))
+
+    # Infer bar=1 onset: just after each normal note that precedes a bar_2 event.
+    bar2_times = {a["timestamp_ms"] for a in bar_anns if a["label"] == "bar_2"}
+    normal_times = [a["timestamp_ms"] for a in normal_anns]
+    for t2 in sorted(bar2_times):
+        preceding = [t for t in normal_times if t < t2]
+        if preceding:
+            # bar=1 starts 1 ms after the last normal note
+            events.append((max(preceding) + 1, 1))
+
+    events.sort()
+    return events
+
+
+def get_bar_at_time(t_ms, bar_events):
+    """Return bar value at t_ms (0=playing, N=bar N of multi-bar rest)."""
+    bar = 0
+    for ts, val in bar_events:
+        if ts <= t_ms:
+            bar = val
+        else:
+            break
+    return bar
+
+
 class ScoreFollowingDataset(Dataset):
     """Dataset for score-following training.
 
@@ -89,7 +143,7 @@ class ScoreFollowingDataset(Dataset):
       - The sheet music image for the current position
       - Audio segment starting at the given timestamp
       - Start position (x, y) on the image
-      - Target: dense positions across the audio segment
+      - Target: dense positions across the audio segment, including bar values
     """
 
     def __init__(self, data_dirs, config, processor=None):
@@ -119,6 +173,7 @@ class ScoreFollowingDataset(Dataset):
 
         lines = detect_lines(annotations)
         line_info = build_interpolation(lines)
+        bar_events = build_bar_timeline(annotations["annotations"])
 
         # Load audio
         try:
@@ -149,12 +204,14 @@ class ScoreFollowingDataset(Dataset):
                 continue
 
             img_idx_start, x_start, y_start = get_position_at_time(t_start, line_info)
+            bar_start = get_bar_at_time(t_start, bar_events)
 
             targets = []
             for i in range(_N_DENSE):
                 t_target = t_start + i * audio_len_ms / (_N_DENSE - 1)
                 img_idx_t, x_t, y_t = get_position_at_time(t_target, line_info)
-                targets.append((x_t, y_t, img_idx_t))
+                bar_t = get_bar_at_time(t_target, bar_events)
+                targets.append((x_t, y_t, img_idx_t, bar_t))
 
             self.samples.append({
                 "audio_data": audio_data,
@@ -163,6 +220,7 @@ class ScoreFollowingDataset(Dataset):
                 "image_paths": image_paths,
                 "image_index": img_idx_start,
                 "start_pos": (x_start, y_start, img_idx_start),
+                "start_bar": bar_start,
                 "targets": targets,
                 "line_info": line_info,
                 "piece_id": str(data_dir),
@@ -193,33 +251,49 @@ class ScoreFollowingDataset(Dataset):
             img = img.resize((cfg.image_width, int(h * cfg.image_width / w)), Image.LANCZOS)
             all_images.append(img)
 
-        from model import xy_to_patch_index
+        from model import xy_to_pos_patch_index
         grid_w, grid_h = cfg.grid_w, cfg.grid_h
-        target_patches = torch.tensor(
-            [xy_to_patch_index(t[0], t[1], t[2], grid_w, grid_h)
+        max_bar = cfg.max_bar
+
+        target_pos_patch = torch.tensor(
+            [xy_to_pos_patch_index(t[0], t[1], grid_w, grid_h)
              for t in sample["targets"]],
+            dtype=torch.long,
+        )
+        target_page = torch.tensor(
+            [t[2] for t in sample["targets"]],
+            dtype=torch.long,
+        )
+        target_bar = torch.tensor(
+            [min(t[3], max_bar - 1) for t in sample["targets"]],
             dtype=torch.long,
         )
         start_pos = torch.tensor(
             [sample["start_pos"][0], sample["start_pos"][1]], dtype=torch.float32,
         )
         start_img = torch.tensor(sample["start_pos"][2], dtype=torch.long)
+        start_bar = torch.tensor(
+            min(sample["start_bar"], max_bar - 1), dtype=torch.long,
+        )
 
         return {
             "audio": torch.tensor(audio_segment, dtype=torch.float32),
             "all_images": all_images,
             "start_pos": start_pos,
             "start_img": start_img,
-            "target_patches": target_patches,
+            "start_bar": start_bar,
+            "target_pos_patch": target_pos_patch,
+            "target_page": target_page,
+            "target_bar": target_bar,
             "piece_id": sample["piece_id"],
         }
 
 
 def collate_fn(batch, processor, audio_sample_rate):
-    """Run the processor on the whole batch inside the DataLoader worker."""
+    """Run the Phi-4 processor on the whole batch inside the DataLoader worker."""
     prompts = [
         "".join(f"<|image_{j+1}|>" for j in range(len(b["all_images"])))
-        + "<|pos|><|page|><|audio_1|>"
+        + "<|pos|><|page|><|bar|><|audio_1|>"
         for b in batch
     ]
     flat_images = [img for b in batch for img in b["all_images"]]
@@ -233,10 +307,13 @@ def collate_fn(batch, processor, audio_sample_rate):
         padding=True,
     )
 
-    inputs["start_pos"]      = torch.stack([b["start_pos"]      for b in batch])
-    inputs["start_img"]      = torch.stack([b["start_img"]      for b in batch])
-    inputs["target_patches"] = torch.stack([b["target_patches"] for b in batch])
-    inputs["piece_ids"]      = [b["piece_id"] for b in batch]
+    inputs["start_pos"]        = torch.stack([b["start_pos"]        for b in batch])
+    inputs["start_img"]        = torch.stack([b["start_img"]        for b in batch])
+    inputs["start_bar"]        = torch.stack([b["start_bar"]        for b in batch])
+    inputs["target_pos_patch"] = torch.stack([b["target_pos_patch"] for b in batch])
+    inputs["target_page"]      = torch.stack([b["target_page"]      for b in batch])
+    inputs["target_bar"]       = torch.stack([b["target_bar"]       for b in batch])
+    inputs["piece_ids"]        = [b["piece_id"] for b in batch]
     return inputs
 
 

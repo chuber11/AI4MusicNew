@@ -393,7 +393,7 @@ def score_following_loss(pos_logits, page_logits, bar_logits,
     pos_acc  = (flat_pos_logits.argmax(-1) == flat_pos_targets).float().mean()
 
     total_loss = pos_loss + page_loss + bar_loss
-    return total_loss, pos_acc, page_acc, bar_acc
+    return total_loss, pos_loss, page_loss, bar_loss, pos_acc, page_acc, bar_acc
 
 
 # ──────────────────────────────────────────────────────────────────────────────

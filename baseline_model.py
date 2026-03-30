@@ -3,7 +3,7 @@
 Uses frozen EnCodec-24kHz encoder (audio) + frozen CLIP ViT-B/32 (images)
 with a small trainable fusion transformer.
 
-Audio encoder: facebook/encodec-24khz
+Audio encoder: facebook/encodec_24khz
   - Causal SEANet CNN — no bidirectional attention, no fixed-length limit.
   - Because it is causal, past encoder outputs are immutable: when new audio
     arrives at inference time only new frames need to be encoded (no recompute).
@@ -64,7 +64,7 @@ class BaselineScoreFollowingModel(nn.Module):
         from transformers import EncodecModel, CLIPVisionModel, CLIPProcessor
 
         # ── Frozen causal audio encoder (EnCodec-24kHz SEANet CNN) ────────────
-        _encodec = EncodecModel.from_pretrained("facebook/encodec-24khz")
+        _encodec = EncodecModel.from_pretrained("facebook/encodec_24khz")
         self.audio_encoder = _encodec.encoder   # EncodecEncoder (causal CNN)
         for p in self.audio_encoder.parameters():
             p.requires_grad = False

@@ -58,7 +58,7 @@ class Config:
     max_bar          = 64           # bar classes: 0=playing, 1..max_bar-1=rest bars
 
     # Training
-    batch_size       = 8
+    batch_size       = 32
     learning_rate    = 1e-4
     weight_decay     = 0.01
     num_epochs       = 50
@@ -155,14 +155,17 @@ def train(config=None):
     best_val_loss = float("inf")
     global_step   = 0
 
+    def _ppl(ce):
+        return math.exp(min(ce, 20))   # cap to avoid overflow on random init
+
     for epoch in range(config.num_epochs):
         model.train()
-        epoch_loss     = 0.0
-        epoch_pos_acc  = 0.0
-        epoch_page_acc = 0.0
-        epoch_bar_acc  = 0.0
-        epoch_steps    = 0
-        w_loss = w_pos = w_page = w_bar = w_steps = 0.0
+        # per-step accumulators
+        e_pos_ce = e_page_ce = e_bar_ce = 0.0
+        e_pos_acc = e_page_acc = e_bar_acc = 0.0
+        e_steps = 0
+        w_pos_ce = w_page_ce = w_bar_ce = 0.0
+        w_pos_acc = w_page_acc = w_bar_acc = w_steps = 0.0
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(tqdm(train_loader)):
@@ -177,19 +180,20 @@ def train(config=None):
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pos_logits, page_logits, bar_logits = model(inputs, start_pos, start_img, start_bar)
-                loss, pos_acc, page_acc, bar_acc = score_following_loss(
+                loss, pos_loss, page_loss, bar_loss, pos_acc, page_acc, bar_acc = score_following_loss(
                     pos_logits, page_logits, bar_logits,
                     target_pos_patch, target_page, target_bar,
                 )
                 loss = loss / config.grad_accum_steps
 
             loss.backward()
-            step_loss = loss.item() * config.grad_accum_steps
-            epoch_loss     += step_loss
-            epoch_pos_acc  += pos_acc.item()
-            epoch_page_acc += page_acc.item()
-            epoch_bar_acc  += bar_acc.item()
-            epoch_steps    += 1
+            e_pos_ce   += pos_loss.item()
+            e_page_ce  += page_loss.item()
+            e_bar_ce   += bar_loss.item()
+            e_pos_acc  += pos_acc.item()
+            e_page_acc += page_acc.item()
+            e_bar_acc  += bar_acc.item()
+            e_steps    += 1
 
             if (batch_idx + 1) % config.grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
@@ -197,35 +201,41 @@ def train(config=None):
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
-                w_loss  += step_loss
-                w_pos   += pos_acc.item()
-                w_page  += page_acc.item()
-                w_bar   += bar_acc.item()
-                w_steps += 1
+                w_pos_ce   += pos_loss.item()
+                w_page_ce  += page_loss.item()
+                w_bar_ce   += bar_loss.item()
+                w_pos_acc  += pos_acc.item()
+                w_page_acc += page_acc.item()
+                w_bar_acc  += bar_acc.item()
+                w_steps    += 1
 
                 if config.log_every_n_steps > 0 and global_step % config.log_every_n_steps == 0:
                     print(
                         f"  step {global_step}"
-                        f"  loss={w_loss/w_steps:.4f}"
-                        f"  pos_acc={w_pos/w_steps:.4f}"
-                        f"  page_acc={w_page/w_steps:.4f}"
-                        f"  bar_acc={w_bar/w_steps:.4f}"
+                        f"  pos_ppl={_ppl(w_pos_ce/w_steps):.1f}({w_pos_acc/w_steps:.3f})"
+                        f"  page_ppl={_ppl(w_page_ce/w_steps):.2f}({w_page_acc/w_steps:.3f})"
+                        f"  bar_ppl={_ppl(w_bar_ce/w_steps):.2f}({w_bar_acc/w_steps:.3f})"
                         f"  lr={scheduler.get_last_lr()[0]:.2e}"
                     )
-                    w_loss = w_pos = w_page = w_bar = w_steps = 0.0
+                    w_pos_ce = w_page_ce = w_bar_ce = 0.0
+                    w_pos_acc = w_page_acc = w_bar_acc = w_steps = 0.0
 
-        avg_train_loss     = epoch_loss     / epoch_steps
-        avg_train_pos_acc  = epoch_pos_acc  / epoch_steps
-        avg_train_page_acc = epoch_page_acc / epoch_steps
-        avg_train_bar_acc  = epoch_bar_acc  / epoch_steps
+        t_pos_ce   = e_pos_ce   / e_steps
+        t_page_ce  = e_page_ce  / e_steps
+        t_bar_ce   = e_bar_ce   / e_steps
+        t_pos_acc  = e_pos_acc  / e_steps
+        t_page_acc = e_page_acc / e_steps
+        t_bar_acc  = e_bar_acc  / e_steps
 
         # ── Validation ────────────────────────────────────────────────────────
         model.eval()
-        val_loss = val_pos = val_page = val_bar = 0.0
+        v_pos_ce = v_page_ce = v_bar_ce = 0.0
+        v_pos_acc = v_page_acc = v_bar_acc = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader):
                 start_pos        = batch.pop("start_pos").to(device)
                 start_img        = batch.pop("start_img").to(device)
+                start_bar        = batch.pop("start_bar").to(device)
                 target_pos_patch = batch.pop("target_pos_patch").to(device)
                 target_page      = batch.pop("target_page").to(device)
                 target_bar       = batch.pop("target_bar").to(device)
@@ -234,32 +244,35 @@ def train(config=None):
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pos_logits, page_logits, bar_logits = model(inputs, start_pos, start_img, start_bar)
-                    loss, pos_acc, page_acc, bar_acc = score_following_loss(
+                    _, pos_loss, page_loss, bar_loss, pos_acc, page_acc, bar_acc = score_following_loss(
                         pos_logits, page_logits, bar_logits,
                         target_pos_patch, target_page, target_bar,
                     )
-                val_loss += loss.item()
-                val_pos  += pos_acc.item()
-                val_page += page_acc.item()
-                val_bar  += bar_acc.item()
+                v_pos_ce   += pos_loss.item()
+                v_page_ce  += page_loss.item()
+                v_bar_ce   += bar_loss.item()
+                v_pos_acc  += pos_acc.item()
+                v_page_acc += page_acc.item()
+                v_bar_acc  += bar_acc.item()
 
         n_val = len(val_loader)
-        avg_val_loss     = val_loss / n_val
-        avg_val_pos_acc  = val_pos  / n_val
-        avg_val_page_acc = val_page / n_val
-        avg_val_bar_acc  = val_bar  / n_val
+        vt_pos_ce   = v_pos_ce   / n_val
+        vt_page_ce  = v_page_ce  / n_val
+        vt_bar_ce   = v_bar_ce   / n_val
+        vt_pos_acc  = v_pos_acc  / n_val
+        vt_page_acc = v_page_acc / n_val
+        vt_bar_acc  = v_bar_acc  / n_val
+        avg_val_loss = vt_pos_ce + vt_page_ce + vt_bar_ce
 
         print(
-            f"Epoch {epoch+1}/{config.num_epochs}  "
-            f"train_loss={avg_train_loss:.4f}  "
-            f"pos_acc={avg_train_pos_acc:.4f}  "
-            f"page_acc={avg_train_page_acc:.4f}  "
-            f"bar_acc={avg_train_bar_acc:.4f}  |  "
-            f"val_loss={avg_val_loss:.4f}  "
-            f"pos_acc={avg_val_pos_acc:.4f}  "
-            f"page_acc={avg_val_page_acc:.4f}  "
-            f"bar_acc={avg_val_bar_acc:.4f}  |  "
-            f"lr={scheduler.get_last_lr()[0]:.2e}"
+            f"Epoch {epoch+1}/{config.num_epochs}\n"
+            f"  train  pos={_ppl(t_pos_ce):7.1f}ppl/{t_pos_acc:.3f}acc"
+            f"  page={_ppl(t_page_ce):6.2f}ppl/{t_page_acc:.3f}acc"
+            f"  bar={_ppl(t_bar_ce):6.2f}ppl/{t_bar_acc:.3f}acc\n"
+            f"  val    pos={_ppl(vt_pos_ce):7.1f}ppl/{vt_pos_acc:.3f}acc"
+            f"  page={_ppl(vt_page_ce):6.2f}ppl/{vt_page_acc:.3f}acc"
+            f"  bar={_ppl(vt_bar_ce):6.2f}ppl/{vt_bar_acc:.3f}acc"
+            f"  lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
         if avg_val_loss < best_val_loss:
@@ -273,7 +286,7 @@ def train(config=None):
                 "config":               vars(config),
                 "model_type":           config.model_type,
             }, save_path)
-            print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
+            print(f"  -> Saved best model (val_total_ce={best_val_loss:.4f})")
 
         if config.save_every_n_epochs > 0 and (epoch + 1) % config.save_every_n_epochs == 0:
             save_path = os.path.join(config.output_dir, f"checkpoint_epoch_{epoch+1}.pt")

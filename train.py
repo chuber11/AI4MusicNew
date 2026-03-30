@@ -55,7 +55,7 @@ class Config:
     pos_num_freqs    = 8            # Fourier frequency bands for (x, y) encoding
     grid_w           = 32           # patch grid width  per page
     grid_h           = 32           # patch grid height per page
-    max_bar          = 16           # bar classes: 0=playing, 1..max_bar-1=rest bars
+    max_bar          = 64           # bar classes: 0=playing, 1..max_bar-1=rest bars
 
     # Training
     batch_size       = 8
@@ -296,7 +296,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Score following model training")
     parser.add_argument("--mode",       choices=["train", "export"], default="train")
-    parser.add_argument("--model-type", choices=["phi4", "baseline"], default="phi4")
+    parser.add_argument("--model-type", choices=["phi4", "baseline"], default="baseline")
     parser.add_argument("--checkpoint", type=str,  help="Path to checkpoint for export")
     parser.add_argument("--output-dir", type=str,  default="onnx_export")
     parser.add_argument("--train-dirs", nargs="+",  default=["data/train/*"])

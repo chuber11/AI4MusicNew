@@ -96,15 +96,18 @@ def infer(config, checkpoint_path, data_dir, output_path,
         start_img = torch.tensor([img_idx_start],      dtype=torch.long,    device=device)
         start_bar_t = torch.tensor([min(bar_start, config.max_bar - 1)], dtype=torch.long, device=device)
 
-        feats = model.audio_feature_extractor(
-            [audio_data], sampling_rate=config.audio_sample_rate,
-            return_tensors="pt", padding="longest",
+        # Resample audio to EnCodec rate (24 kHz)
+        import librosa as _librosa
+        audio_24k = _librosa.resample(
+            audio_data, orig_sr=config.audio_sample_rate, target_sr=model.ENCODER_SR,
         )
+        audio_24k_t = torch.from_numpy(audio_24k).unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+
         img_inputs = model.clip_processor(images=all_images, return_tensors="pt")
         inputs = {
-            "audio_features": feats["input_features"],
-            "pixel_values":   img_inputs["pixel_values"],
-            "num_pages":      num_pages,
+            "audio_24k":    audio_24k_t,
+            "pixel_values": img_inputs["pixel_values"],
+            "num_pages":    num_pages,
         }
     else:
         model = ScoreFollowingModel(config)

@@ -271,9 +271,16 @@ class ScoreFollowingModel(nn.Module):
         )
 
         last_hidden  = outputs.hidden_states[-1].float()   # (B, seq_len, H)
-        pos_logits   = self.pos_head(last_hidden)           # (B, seq_len, grid_w*grid_h)
-        page_logits  = self.page_head(last_hidden)          # (B, seq_len, max_num_images)
-        bar_logits   = self.bar_head(last_hidden)           # (B, seq_len, max_bar)
+
+        # Only run heads on audio tokens (everything after <|bar|>).
+        # _bar_locs rows are (batch_idx, seq_pos); all items in a batch share the
+        # same sequence layout, so position [0,1] gives the audio start offset.
+        audio_start  = self._bar_locs[0, 1].item() + 1
+        audio_hidden = last_hidden[:, audio_start:, :]      # (B, n_audio, H)
+
+        pos_logits   = self.pos_head(audio_hidden)           # (B, n_audio, grid_w*grid_h)
+        page_logits  = self.page_head(audio_hidden)          # (B, n_audio, max_num_images)
+        bar_logits   = self.bar_head(audio_hidden)           # (B, n_audio, max_bar)
         return pos_logits, page_logits, bar_logits
 
     def get_collate_fn(self, audio_sample_rate):
